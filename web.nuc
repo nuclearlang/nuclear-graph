@@ -1,0 +1,176 @@
+use os
+use asyncio
+use ipaddress
+use socket
+use httpx
+use httpx{ Response }
+use html{ unescape }
+use html/parser{ HTMLParser }
+use urllib/parse{ quote, urljoin, urlparse }
+
+AGENT = "nuclear-developer/0.1 (local agent; +https://github.com/nuclearlang/nuclear-developer)"
+SKIP_TAGS = ["script", "style", "pre", "code", "noscript", "svg", "nav", "header", "footer", "form", "button", "template"]
+BLOCK_TAGS = ["p", "div", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "section", "article", "table", "dd", "dt"]
+
+// The readable text of a page as its tags go by: what is inside a script, a style, a menu or a code block is left
+// out, and a block starts a line.
+PageText: HTMLParser
+  out: string[] = []
+  skip: int = 0
+
+  ()
+    super(convertCharrefs = true)
+
+  handleStarttag(tag: string, attrs: any[]) void
+    if tag in SKIP_TAGS
+      skip += 1
+    else if tag in BLOCK_TAGS
+      out.add("\n")
+
+  handleEndtag(tag: string) void
+    if tag in SKIP_TAGS and skip > 0
+      skip -= 1
+    else if tag in BLOCK_TAGS
+      out.add("\n")
+
+  handleData(data: string) void
+    if skip == 0
+      out.add(data)
+
+// The readable text of a page: no scripts, styles, menus or code blocks.
+pageText(html: string) string
+  page = PageText()
+  page.feed(html)
+  lines = page.out.join("").split("\n").map((line) => line.replaceAll(Regex(r"[ \t\r\f\v]+"), " ").trim())
+  lines.filter((line: string) => line.length > 0).join("\n")
+
+// Markdown or plain text without its fenced code blocks.
+withoutCode(text: string) string
+  text.replaceAll(Regex(r"(?s)```.*?(```|$)"), "").trim()
+
+// An http(s) url whose host resolves only to public addresses (never this machine or the local network).
+publicUrl(url: string) boolean
+  u = urlparse(url)
+  host: string = u.hostname ?? ""
+  if not (u.scheme in ["http", "https"]) or host.length == 0
+    return false
+  try
+    for info in socket.getaddrinfo(host, u.port ?? (u.scheme == "https" ? 443 : 80))
+      address = "${info[4][0]}".split("%")[0]
+      if not ipaddress.ipAddress(address).isGlobal
+        return false
+    true
+  catch e
+    false
+
+clipText(text: string, limit: int) string
+  if text.length <= limit
+    return text
+  head = text.substring(0, limit)
+  at = head.lastIndexOf(" ")
+  "${at < 0 ? head : head.substring(0, at)} …"
+
+// A text of a search result without its tags.
+hitText(text: any) string
+  raw = "${text ?? ""}"
+  shown: string = unescape(raw.replaceAll(Regex(r"<[^>]+>"), ""))
+  shown.trim()
+
+// The internet for the local agents: search, and read a page as plain text. What comes back is facts for the
+// business logic (a rule, a format, an external API's routes), never code: code blocks are removed, so the agents
+// keep writing only Nuclear. Pages are untrusted text, and a page on this machine or the local network is never read
+// (the graph and the Developer listen on 127.0.0.1).
+//
+// The search engine, the first one available: SearXNG of your own (`NUCLEAR_SEARXNG_URL`), Brave Search with the key
+// kept by `nuclear-graph web-key brave`, else Wikipedia (no key).
+Web(timeout: double = 20)
+  // searxng, brave or wikipedia: the search engine in use.
+  engine() string
+    own: string = os.environ.get("NUCLEAR_SEARXNG_URL") ?? ""
+    if own.length > 0
+      return "searxng"
+    Secrets.find("search:brave") != null ? "brave" : "wikipedia"
+
+  // The first results of a search, each [title, url, text].
+  hits(query: string, k: int) string[][]
+    chosen = engine()
+    http = httpx.AsyncClient(timeout = timeout, headers = { "User-Agent": AGENT })
+    try
+      out: string[][] = []
+      if chosen == "searxng"
+        own: string = os.environ.get("NUCLEAR_SEARXNG_URL") ?? ""
+        mine: Response = ~http.get("${own.replaceAll(Regex(r"/+$"), "")}/search", params = { "q": query, "format": "json" })
+        mine.raiseForStatus()
+        results: <string, any>[] = mine.json().get("results", [])
+        for h in results.take(k)
+          out.add(["${h["title"] ?? ""}", "${h["url"] ?? ""}", "${h["content"] ?? ""}"])
+        return out
+      if chosen == "brave"
+        brave: Response = ~http.get("https://api.search.brave.com/res/v1/web/search", params = { "q": query, "count": k }, headers = { "X-Subscription-Token": Secrets.find("search:brave") ?? "", "Accept": "application/json" })
+        brave.raiseForStatus()
+        pages: <string, any>[] = brave.json().get("web", {}).get("results", [])
+        for h in pages.take(k)
+          out.add(["${h["title"] ?? ""}", "${h["url"] ?? ""}", "${h["description"] ?? ""}"])
+        return out
+      r: Response = ~http.get("https://en.wikipedia.org/w/api.php", params = { "action": "query", "list": "search", "srsearch": query, "srlimit": k, "format": "json" })
+      r.raiseForStatus()
+      found: <string, any>[] = r.json().get("query", {}).get("search", [])
+      for h in found
+        title = "${h["title"]}"
+        out.add([title, "https://en.wikipedia.org/wiki/${quote(title.replaceAll(" ", "_"))}", "${h["snippet"] ?? ""}"])
+      out
+    finally
+      ~http.aclose()
+
+  // The first results of a search: `title — url` and a line of text each, or why there are none.
+  search(query: string, k: int = 5) string
+    try
+      found: string[][] = ~hits(query, k)
+      if found.length == 0
+        return "no results (${engine()}) for: ${query}"
+      lines: string[] = []
+      for at in 0..found.length
+        lines.add("${at + 1}. ${hitText(found[at][0])} — ${found[at][1]}\n   ${hitText(found[at][2])}")
+      lines.join("\n")
+    catch e
+      "the search (${engine()}) failed: ${e}"
+
+  // The text of a public page, without code blocks, at most `limit` characters.
+  read(url: string, limit: int = 6000) string
+    http = httpx.AsyncClient(timeout = timeout, headers = { "User-Agent": AGENT }, followRedirects = false)
+    try
+      at = url
+      // each redirect is checked like the first url
+      for hop in 0..4
+        open: boolean = ~asyncio.toThread(publicUrl, at)
+        if not open
+          return "not read: ${at} is not a public http(s) address"
+        r: Response? = null
+        try
+          r = ~http.get(at)
+        catch e
+          return "not read: ${at} (${e})"
+        got: Response = r!
+        if got.isRedirect and "location" in got.headers
+          at = urljoin(at, got.headers["location"])
+          continue
+        if got.statusCode >= 400
+          return "not read: ${at} answered ${got.statusCode}"
+        kind: string = got.headers.get("content-type", "")
+        whole: string = got.text
+        body: string = "html" in kind ? pageText(whole) : (kind.startsWith("text/") ? withoutCode(whole) : "")
+        return body.length > 0 ? clipText(body, limit) : "not read: ${at} is not text (${kind})"
+      "not read: ${url} redirects too many times"
+    finally
+      ~http.aclose()
+
+  // A search and the text of its first pages, ready for a prompt: the sources first, then each page.
+  research(query: string, pages: int = 2, limit: int = 2500) string
+    found: string = ~search(query, k = 5)
+    urls = Regex(r" — (https?://\S+)").findAll(found).map((m) => m[1] ?? "").take(pages)
+    texts: string[] = ~awaitAll(urls.map((url) => read(url, limit)))
+    parts = ["Search (${engine()}): ${query}\n\n${found}"]
+    for at in 0..urls.length
+      if not texts[at].startsWith("not read")
+        parts.add("## ${urls[at]}\n\n${texts[at]}")
+    parts.join("\n\n")

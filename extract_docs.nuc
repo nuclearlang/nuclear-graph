@@ -1,0 +1,211 @@
+use hashlib
+use pathlib{ Path, PurePosixPath }
+
+// the user's teaching material: never published nor ingested
+PRIVATE = ["docs/aprende", "CodeBuilder"]
+DIALECTS = ["typescript", "dart", "python", "fastapi", "nestjs", "flutter", "react"]
+OTHER = { "id": "99-other", "title": "Documents no section claims yet: give them a section in sections.toml", "agents": false, "shelf": "docs" }
+PREFIX = { "docs": "doc", "language": "lang", "platforms": "spec" }
+
+// A document of the tree: the path the sections name, its repository and its file.
+Document(rel: string, repo: string, path: Path)
+
+// A piece of a document: the headings it is under, its text and its name in the row's id.
+Piece(heading: string, body: string, name: string)
+
+// The rows of every markdown file of the tree, section by section, on the shelf its section names.
+ExtractDocs
+  // Pieces of at most the size of a section, cut at blank lines.
+  static split(text: string) string[]
+    most = sectionSize()
+    out: string[] = []
+    buf: string[] = []
+    size = 0
+    for block in text.split(Regex(r"\n\s*\n"))
+      para = block
+      if size + para.length > most and buf.length > 0
+        out.add(buf.join("\n\n"))
+        buf = []
+        size = 0
+      // a long code block or table: cut at a line
+      while para.length > most
+        cut = para.substring(0, most).lastIndexOf("\n")
+        cut = cut > most ~/ 2 ? cut : most
+        out.add(para.substring(0, cut))
+        para = para.substring(cut).replaceAll(Regex(r"^\n+"), "")
+      buf.add(para)
+      size += para.length + 2
+    if buf.length > 0 and buf.join("").trim().length > 0
+      out.add(buf.join("\n\n"))
+    out
+
+  // The sections of a markdown file (by `#`/`##`/`###` headings) as [heading path, text] pairs, each cut to size.
+  static markdown(text: string) string[][]
+    // the front matter of a context file
+    whole = text.replaceAll(Regex(r"(?s)\A---\n.*?\n---\n"), "")
+    out: string[][] = []
+    path: string[] = []
+    lines: string[] = []
+    fence = false
+    flush = ()
+      body = lines.join("\n").trim()
+      if body.length > 0
+        for piece in ExtractDocs.split(body)
+          out.add([path.join(" › "), piece])
+    heading = Regex(r"^(#{1,3}) (.*)")
+    for line in linesOf(whole)
+      if line.trimStart().startsWith("```")
+        fence = not fence
+      m = fence ? null : heading.find(line)
+      if m != null
+        flush()
+        level = (m![1] ?? "").length
+        path = [...path.take(level - 1), plain(m![2] ?? "").trim()]
+        lines = []
+      else
+        lines.add(line)
+    flush()
+    out
+
+  static kindOf(rel: string) string
+    name = rel.split("/").last
+    if "/adr/" in "/${rel}"
+      return "adr"
+    if name == "STATUS.md"
+      return "status"
+    if name == "CHANGELOG.md"
+      return "changelog"
+    if name in ["README.md", "AGENTS.md", "CONTRIBUTING.md"]
+      return "readme"
+    if "/context/" in rel
+      return "context"
+    if "/spec/" in "/${rel}" or rel.startsWith("specs/")
+      return "spec"
+    if "docs/language/" in rel or "docs/dragonfly/" in rel or "docs/ai/" in rel
+      return "guide"
+    "doc"
+
+  static dialectOf(rel: string) string
+    parts = rel.split(Regex(r"[/_.\-]"))
+    DIALECTS.find((d) => d in parts) ?? ""
+
+  static platformOf(rel: string, dialect: string) string
+    known: string = platformOfDialect(dialect)
+    if known.length > 0
+      return known
+    parts = rel.split(Regex(r"[/_.\-]"))
+    platformNames().find((p) => p in parts) ?? ""
+
+  // Every markdown (and grammar) file of the tree and the website.
+  static documents(tree: Path, website: Path?) Document[]
+    out: Document[] = []
+    roots: Path[] = [tree]
+    if website != null and website!.isDir()
+      roots.add(website!)
+    for root in roots
+      prefix = root == tree ? "" : "website/"
+      for path in walk(root)
+        rel: string = path.relativeTo(root).asPosix()
+        parts = rel.split("/")
+        if PRIVATE.any((p) => rel.startsWith(p)) or not (path.suffix in [".md", ".ebnf"])
+          continue
+        repo: string = prefix.length > 0 ? "website" : (parts.length > 1 and root.joinpath(parts[0], ".git").exists() ? parts[0] : root.name)
+        out.add(Document("${prefix}${rel}", repo, path))
+    out
+
+  static matches(rel: string, globs: any[]) boolean
+    p = PurePosixPath(rel)
+    globs.any((g) => p.fullMatch(g))
+
+  // `<shelf>/<section>` → [what it holds, the rows of every document of that section, one per heading section].
+  static docs(ctx: Context) <string, any[]>
+    sections: <string, any>[] = []
+    for s in listAt(ctx.sections ?? {}, "section")
+      held: <string, any> = { ...s }
+      held["shelf"] = s.get("shelf", "docs")
+      held["agents"] = s.get("agents", true)
+      sections.add(held)
+    other: <string, any> = OTHER
+    prefixes: <string, string> = PREFIX
+    excluded: any[] = listAt(ctx.sections ?? {}, "exclude")
+    out: <string, any[]> = {}
+    for doc in ExtractDocs.documents(ctx.tree, ctx.website)
+      rel: string = doc.rel
+      if ExtractDocs.matches(rel, excluded)
+        continue
+      section: <string, any> = sections.find((s) => ExtractDocs.matches(rel, s["files"]!)) ?? other
+      shelf = "${section["shelf"]}"
+      agentsRead = section["agents"] == true
+      if section["id"] == other["id"]
+        ctx.problems.add("${rel}: no section of sections.toml claims it")
+      text: string = doc.path.readText(errors = "replace")
+      if doc.path.suffix == ".ebnf"
+        text = "# The grammar of NuclearLang (EBNF)\n\n```text\n${text}\n```"
+      headed: string = captured(r"^# (.+)$", text, multiline = true)
+      title: string = plain(headed.length > 0 ? headed : "${doc.path.stem}")
+      dialect: string = ExtractDocs.dialectOf(rel)
+      plat: string = ExtractDocs.platformOf(rel, dialect)
+      kind: string = ExtractDocs.kindOf(rel)
+      file = "${shelf}/${section["id"]}"
+      if not (file in out)
+        out[file] = [section["title"], []]
+      rows: any[] = out[file]![1]
+      pieces: Piece[] = []
+      for pair in ExtractDocs.markdown(text)
+        heading: string = pair[0]
+        body = agentsRead ? Assets.nuclearOnly(pair[1]).trim() : pair[1]
+        // not a heading alone, nor only code a local agent does not read
+        if body.length >= 40
+          // the id of a piece: its heading without the document's own title
+          under = heading.split(" › ").skip(1).join(" ")
+          pieces.add(Piece(heading, body, slug(under.length > 0 ? under : (heading.length > 0 ? heading : "top"), 80)))
+      shared = pieces.map((p) => p.name).filter((name) => pieces.count((p) => p.name == name) > 1)
+      used: string[] = []
+      for piece in pieces
+        marks = ["|", "```", "#", "-", "*", ">", "<"]
+        prose = linesOf(piece.body).filter((ln) => ln.trim().length > 0 and not marks.any((mark) => ln.trimStart().startsWith(mark)))
+        last = piece.heading.length > 0 ? piece.heading.split(" › ").last : ""
+        // a heading cut in several pieces names each by its text, so a piece added above does not rename the rest
+        part = piece.name in shared ? "${piece.name}.${hashlib.sha1(piece.body.toBytes()).hexdigest().substring(0, 6)}" : piece.name
+        while part in used
+          part = "${part}+"
+        used.add(part)
+        meta: <string, any> = shelf == "docs" ? { "section": section["id"], "repo": doc.repo, "dialect": dialect } : {}
+        type = shelf == "docs" ? kind : (shelf == "language" ? ("docs/language/" in rel ? "guide" : ("/brief/" in rel ? "reference" : "rule")) : "spec")
+        told = prose.join(" ")
+        rows.add({
+          "id": "${prefixes[shelf]}:${rel.replaceAll(Regex(r"[^A-Za-z0-9_.@/+-]"), "-")}#${part}",
+          "type": type,
+          "title": clip(last == "" or last == title ? title : "${title} — ${last}", 140),
+          "summary": firstSentence(told.length > 0 ? told : (last.length > 0 ? last : title), 300), "body": piece.body,
+          "platforms": plat.length > 0 ? [plat] : [], "agents": agentsRead, "sources": [rel], "meta": meta,
+        })
+    out
+
+// Every generated asset file: `<shelf>/<name>` → [what it holds, its rows].
+generateAssets(ctx: Context) <string, any[]>
+  out: <string, any[]> = {
+    "errors/diagnostics": ["Every diagnostic of the compiler: the codes of crates/nuclear-diag and their documentation in spec/diagnostics.md.", ExtractErrors.diagnostics(ctx)],
+    "errors/habits": ["What someone who knows another language writes by reflex, and the Nuclear form (the base brief's table).", ExtractErrors.habits(ctx)],
+    "language/library": ["The members of the standard library and the names of other languages they replace (crates/nuclear-dialect/src/library.rs).", ExtractLibrary.library(ctx)],
+    "tools/cli": ["The commands of nuclear, dragonfly, nuclear-loop and nuclear-graph, as their help prints them.", ExtractTools.cli(ctx)],
+    "tools/mcp": ["The tools and the instructions of the Nuclear MCP server.", ExtractTools.mcp(ctx)],
+    "tools/http": ["The HTTP routes of the Smart Graph and of the Nuclear Developer.", ExtractTools.http(ctx)],
+    "tools/generators": ["What `dragonfly gen` writes on each platform (the [[generators]] of each platform.toml).", ExtractPlatforms.generators(ctx)],
+    "tools/stages": ["The stages of the Nuclear Loop (nuclear-vscode/src/loopEngine.ts).", ExtractTools.stages(ctx)],
+    "tools/agents": ["The local agents of the Nuclear Developer, from their sources.", ExtractTools.agents(ctx)],
+    "tools/editor": ["The commands, shortcuts and settings of the VS Code extension (its package.json).", ExtractTools.editor(ctx)],
+    "tools/components": ["Each component of the ecosystem and its version.", ExtractTools.components(ctx)],
+    "examples/projects": ["Every .nuc file of the example projects, by kind and platform, and the standard library's programs.", ExtractExamples.projects(ctx)],
+    "examples/solved": ["The validated answers of a frontier model to the evaluation's train tasks.", ExtractExamples.solved(ctx)],
+  }
+  for p in platformNames()
+    out["platforms/${p}"] = ["The ${p} platform: its kinds, decorators, layout and plugins (platform.toml and the default dialect's docs.toml).", ExtractPlatforms.platform(ctx, p)]
+  for name, value in ExtractDocs.docs(ctx)
+    out[name] = value
+  kept: <string, any[]> = {}
+  for name, value in out
+    rows: any[] = value[1]
+    if rows.length > 0
+      kept[name] = value
+  kept

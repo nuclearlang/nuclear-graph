@@ -1,0 +1,9 @@
+{
+  "app": "nuclear_graph",
+  "controllers": {},
+  "dialect": "python",
+  "models": {},
+  "platform": null,
+  "repositories": {},
+  "version": "0.2.0"
+}

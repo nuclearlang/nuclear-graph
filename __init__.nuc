@@ -1,0 +1,3 @@
+// Nuclear Smart Graph: the local, private knowledge base of NuclearLang and Dragonfly (shelves of cards and a table of
+// exact facts), and their MCP server. Written in Nuclear; this package is what `nuclear build` writes from it.
+PACKAGE = "nuclear-graph"

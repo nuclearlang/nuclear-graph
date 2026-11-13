@@ -1,0 +1,291 @@
+// how much closer a row gets by carrying a name the query writes: a plain word, a longer name, a name nothing else is
+// written like (a code `n0114`, a decorator `@get`, a phrase of three words or more)
+KEY_WORD = 0.12
+KEY_NAME = 0.22
+KEY_CODE = 0.32
+// a card answers before the long document it was written from
+DOCS_PENALTY = 0.04
+// sections of one document in a result
+PER_SOURCE = 2
+META_LISTS = ["kinds", "tags", "keys", "links", "platforms"]
+// What each sign that a request is of a strategy's kind is worth. An exact sign (the request writes a diagnostic code,
+// a test's output, `rename A to B`) outweighs any closeness of meaning; meaning decides between strategies that have
+// no exact sign, or the same ones.
+SIGNAL = 3.0
+TRIGGER = 1.0
+TARGET = 1.5
+MEANING = [2.5, 2.0, 1.5, 1.0, 0.5]
+
+// The words that name nothing (English and Spanish: people ask in both).
+stopWords() string[]
+  words: string = "the and for with that this from what when where which how why who does can are was has have not you your its into use using used about all any each more most some than then them they there here make made get got set let via que como cual donde cuando por para con una uno unos unas los las del este esta esto ese esa eso hay son ser puede puedo hace hacer tiene tengo sirve funciona funcionan sobre entre desde hasta pero porque mas muy"
+  out: string[] = []
+  for word in words.split(" ")
+    out.add(word)
+  out
+
+// How the graph is searched (ADR-0104): by meaning and by exact name at once, over several shelves.
+//
+// 1. The query is embedded once and each shelf answers its closest rows (a row is found by its own text or by one of
+//    the questions it answers).
+// 2. The exact names the query writes (`N0114`, `dragonfly gen`, `usecase`, `mcp`) are looked up in the rows' `keys`:
+//    a row that carries one is brought in and moves up, more for a longer name.
+// 3. The rows are ranked together, each card once; a search may follow the links of the best ones.
+Retrieve
+  // The words of a text as a query writes names: lower case, without the punctuation around them.
+  static wordsOf(text: string) string[]
+    found: string[] = []
+    for m in Regex(r"[a-z0-9_@.:/-]+").findAll(text.lower())
+      word = m.text.replaceAll(Regex(r"^[.:-]+|[.:-]+$"), "")
+      if word.length > 0
+        found.add(word)
+    found
+
+  // The exact names a query may be writing: every run of 1 to 5 of its words, in lower case.
+  static candidates(query: string) string[]
+    words: string[] = Retrieve.wordsOf(query)
+    stop: string[] = stopWords()
+    out: string[] = []
+    for n in [5, 4, 3, 2, 1]
+      for i in 0..Math.max(0, words.length - n + 1)
+        gram = words.slice(i, i + n).join(" ")
+        if n > 1 or (not (gram in stop) and gram.length >= 3)
+          out.add(gram)
+    out.unique().take(40)
+
+  // The filter of a search: what a local agent may read, the rows of a platform (and of every platform), and the
+  // caller's own filter.
+  static scope(platform: string = "", agents: boolean = false, where: <string, any>? = null) <string, any>?
+    parts: <string, any>[] = []
+    if agents
+      parts.add({ "agents": true })
+    if platform.length > 0
+      parts.add({ "$or": [{ "platforms": { "$contains": platform } }, { "platforms": { "$contains": "all" } }] })
+    own: <string, any> = where ?? {}
+    for key, value in own
+      // a list field (`kinds`, `tags`, `keys`, `links`) given one text: the rows whose list has it
+      part: <string, any> = {}
+      part[key] = value
+      if key in META_LISTS and value is string
+        part[key] = { "$contains": value }
+      parts.add(part)
+    if parts.length == 0
+      return null
+    parts.length == 1 ? parts[0] : { "$and": parts }
+
+  static weight(key: string) double
+    if Regex(r"\d|[@_/]").test(key) or key.split(" ").length >= 3
+      return KEY_CODE
+    " " in key or "-" in key or "." in key ? KEY_NAME : KEY_WORD
+
+  static both(first: <string, any>?, second: <string, any>) <string, any>
+    first == null ? second : { "$and": [first!, second] }
+
+  // The `k` cards that answer a query best: {id, shelf, text, meta, distance, score, via} and, for a card of the
+  // knowledge base, `card` (its fields) and with `expand` the rows it links to (`related`). `score` ranks them (the
+  // distance less what a name the query writes is worth); `distance` is by meaning alone.
+  static search(store: Store, query: string, among: string[], k: int = 5, platform: string = "", agents: boolean = false, where: <string, any>? = null, expand: boolean = false) <string, any>[]
+    vector = store.embedQuery(query)
+    grams: string[] = Retrieve.candidates(query)
+    base = Retrieve.scope(platform, agents, where)
+    best: <string, <string, any>> = {}
+    consider = (shelf: string, hit: <string, any>, bonus: double)
+      meta: <string, any> = hit["meta"] ?? {}
+      card = "${meta["card"] ?? hit["id"]}"
+      distance: double = hit["distance"]!
+      score = distance - bonus + (shelf == "docs" ? DOCS_PENALTY : 0.0)
+      known = best[card]
+      // `distance`: the closest the card came by meaning (its text or a question it answers), whatever ranked it
+      closest: double = known == null ? distance : Math.min(distance, known!["distance"]!)
+      if known == null or score < known!["score"]
+        via = bonus > 0 ? "key" : "${meta["facet"] ?? "card"}"
+        best[card] = { "id": card, "shelf": shelf, "distance": closest, "score": (score * 10000).round() / 10000, "via": via, "source": meta["source"] ?? "" }
+      else
+        known!["distance"] = closest
+    known: <string, Shelf> = shelfTable()
+    for shelf in among
+      for hit in store.near(shelf, vector, Math.max(k * 3, 12), base)
+        consider(shelf, hit, 0.0)
+      if grams.length > 0 and shelf in known
+        named: <string, any>[] = grams.map((g) => { "keys": { "$contains": g } })
+        keyed = store.where(shelf, Retrieve.both(base, named.length == 1 ? named[0] : { "$or": named }), limit = 40)
+        bonus: <string, double> = {}
+        for hit in keyed
+          meta: <string, any> = hit["meta"] ?? {}
+          keys: string[] = meta["keys"] ?? []
+          weights: double[] = keys.filter((key) => key in grams).map((key) => Retrieve.weight(key))
+          bonus["${hit["id"]}"] = weights.max() ?? 0.0
+        for hit in store.measure(shelf, vector, bonus.keys)
+          consider(shelf, hit, bonus["${hit["id"]}"] ?? 0.0)
+
+    picked: <string, any>[] = []
+    perSource: <string, int> = {}
+    for item in best.values.sortedBy((i) => i["score"]!)
+      source = "${item["source"]}"
+      if item["shelf"] == "docs" and source.length > 0
+        perSource[source] = (perSource[source] ?? 0) + 1
+        if perSource[source]! > PER_SOURCE
+          continue
+      picked.add(item)
+      if picked.length == k
+        break
+
+    for shelf in picked.map((i) => "${i["shelf"]}").unique()
+      found = store.documents(shelf, picked.filter((i) => i["shelf"] == shelf).map((i) => "${i["id"]}"))
+      for item in picked
+        stored = found["${item["id"]}"]
+        if item["shelf"] == shelf and stored != null
+          Retrieve.fill(item, stored!)
+    picked = picked.filter((i) => "text" in i)
+    if expand
+      Retrieve.expand(store, picked)
+    for item in picked
+      item.remove("source")
+    picked
+
+  // The capabilities rows that apply to a text (a spec, a task) because it writes one of their `triggers`: what the
+  // platform cannot do yet, a limit, a part never run for real. Exact, never by meaning: {id, type, title, summary,
+  // trigger}.
+  static applies(store: Store, text: string, platform: string = "") <string, any>[]
+    low = text.lower()
+    out: <string, any>[] = []
+    for row in store.where("capabilities", Retrieve.scope(platform, true, { "facet": "card" }) ?? {})
+      meta: <string, any> = row["meta"] ?? {}
+      triggers: string[] = meta["triggers"] ?? []
+      hit = triggers.find((t) => Regex("\\b${re.escape(t)}s?\\b").test(low))
+      if hit != null
+        rid = "${row["id"]}"
+        card: <string, any> = Assets.cardOf("${store.documents("capabilities", [rid])[rid]!["text"]}") ?? {}
+        out.add({ "id": rid, "type": meta["type"] ?? "", "title": card["title"] ?? rid, "summary": card["summary"] ?? "", "trigger": hit })
+    out
+
+  // The strategies that fit a request (a spec, a task, an order of the chat), best first: {id, title, summary, score,
+  // why, data, text}. A strategy row says how its kind of request is recognised: `data.signals` (regular expressions
+  // over the request), `meta.triggers` (its words), `data.target` (`existing`: the request names a declaration the
+  // project has; `new`: one it has not; the caller gives both lists) and, by meaning, its text and the questions it
+  // answers. `runnable`: the caller is a run of the Loop, which a strategy without stages (a question, a command, a
+  // limit) would stop: such a strategy comes first only when an exact sign chose it. `only`: the strategy the request
+  // itself names (`usecase` or `strategy:usecase`), which then comes first. Nothing here asks a model.
+  static strategy(store: Store, text: string, platform: string = "", existing: string[]? = null, fresh: string[]? = null, runnable: boolean = false, only: string = "") <string, any>[]
+    low = text.lower()
+    rows = store.where("playbooks", Retrieve.scope(platform, true, { "facet": "card", "type": "strategy" }) ?? {})
+    ids: string[] = rows.map((r) => "${r["id"]}")
+    cards: <string, <string, any>> = {}
+    for rid, stored in store.documents("playbooks", ids)
+      cards[rid] = Assets.cardOf("${stored["text"]}") ?? {}
+    scores: <string, double> = {}
+    why: <string, string[]> = {}
+    for rid in ids
+      scores[rid] = 0.0
+      why[rid] = []
+    for row in rows
+      rid = "${row["id"]}"
+      data: <string, any> = (cards[rid] ?? {})["data"] ?? {}
+      meta: <string, any> = row["meta"] ?? {}
+      signals: string[] = data["signals"] ?? []
+      for pattern in signals
+        m = Regex(pattern, ignoreCase = true, multiline = true).find(text)
+        if m != null
+          scores[rid] = scores[rid]! + SIGNAL
+          said = m!.text.trim().split(Regex(r"\s+")).join(" ")
+          why[rid]!.add("it writes \"${said.substring(0, Math.min(48, said.length))}\"")
+      triggers: string[] = meta["triggers"] ?? []
+      hits = triggers.filter((t) => Regex("\\b${re.escape(t)}\\b").test(low))
+      if hits.length > 0
+        scores[rid] = scores[rid]! + TRIGGER * Math.min(hits.length, 3)
+        why[rid]!.add("it says ${hits.take(3).map((t) => "\"${t}\"").join(", ")}")
+      aim = "${data["target"] ?? ""}"
+      if aim.length > 0 and (existing != null or fresh != null)
+        names: string[] = (aim == "existing" ? existing : fresh) ?? []
+        fits = names.length > 0
+        scores[rid] = scores[rid]! + (fits ? TARGET : -2 * TARGET)
+        if fits
+          why[rid]!.add("${names.take(3).join(", ")}: ${aim == "existing" ? "the project has it" : "new to the project"}")
+    if fresh != null and fresh!.length >= 2
+      // a request that introduces two declarations or more is a design to build, whatever else its words say (a use
+      // case names its repository; a feature says what should happen)
+      for row in rows
+        info: <string, any> = row["meta"] ?? {}
+        scores["${row["id"]}"] = scores["${row["id"]}"]! + (info["family"] == "create" ? TARGET : -2 * TARGET)
+    near = Retrieve.search(store, text.substring(0, Math.min(500, text.length)), ["playbooks"], k = MEANING.length, platform = platform, agents = true, where = { "type": "strategy" })
+    rank = 0
+    for hit in near
+      rid = "${hit["id"]}"
+      if rid in scores
+        scores[rid] = scores[rid]! + MEANING[rank]
+        if rank == 0
+          why[rid]!.add("the closest in meaning")
+      rank += 1
+    exact = ids.filter((rid) => why[rid]!.any((w) => w.startsWith("it writes")))
+    ranked = ids.sortedBy((rid) => -scores[rid]!)
+    if runnable
+      ranked.sortBy((rid) => not (Retrieve.staged(cards[rid] ?? {}) or rid in exact))
+    asked = only.startsWith("strategy:") ? only : "strategy:${only}"
+    if asked in scores
+      ranked.sortBy((rid) => rid != asked)
+      why[asked] = ["the request asks for it"]
+    out: <string, any>[] = []
+    for rid in ranked.take(3)
+      card: <string, any> = cards[rid] ?? {}
+      out.add({ "id": rid, "title": card["title"] ?? rid, "summary": card["summary"] ?? "", "score": (scores[rid]! * 100).round() / 100, "why": why[rid]!.join("; "), "data": card["data"] ?? {}, "text": card.length > 0 ? Assets.render(card) : "" })
+    out
+
+  // Whether a strategy's card names stages of the Loop.
+  static staged(card: <string, any>) boolean
+    data: <string, any> = card["data"] ?? {}
+    stages: any[] = data["stages"] ?? []
+    stages.length > 0
+
+  static fill(item: <string, any>, stored: <string, any>) void
+    card = Assets.cardOf("${stored["text"]}")
+    item["meta"] = stored["meta"]
+    item["text"] = card != null ? Assets.render(card!) : stored["text"]
+    if card != null
+      item["card"] = card
+
+  // One card by its id, with the rows it links to.
+  static byId(store: Store, cardId: string, expand: boolean = true) <string, any>?
+    shelf = shelfOf(cardId)
+    found: <string, <string, any>> = shelf.length > 0 ? store.documents(shelf, [cardId]) : {}
+    stored = found[cardId]
+    if stored == null
+      return null
+    item: <string, any> = { "id": cardId, "shelf": shelf, "distance": 0.0, "score": 0.0, "via": "id" }
+    Retrieve.fill(item, stored!)
+    if expand
+      Retrieve.expand(store, [item], limit = 12)
+    item
+
+  // Adds to each card the title and summary of the rows it links to (`limit` per search, the closest cards first).
+  static expand(store: Store, items: <string, any>[], limit: int = 6) void
+    have: string[] = items.map((i) => "${i["id"]}")
+    owners: <string, any>[] = []
+    wanted: <string, any>[] = []
+    for item in items
+      card: <string, any> = item["card"] ?? {}
+      links: <string, any>[] = card["links"] ?? []
+      for link in links
+        if not ("${link["to"]}" in have) and wanted.length < limit
+          owners.add(item)
+          wanted.add(link)
+    byShelf: <string, string[]> = {}
+    for link in wanted
+      shelf = shelfOf("${link["to"]}")
+      if not (shelf in byShelf)
+        byShelf[shelf] = []
+      byShelf[shelf]!.add("${link["to"]}")
+    docs: <string, <string, any>> = {}
+    for shelf, ids in byShelf
+      if shelf.length > 0
+        for rid, stored in store.documents(shelf, ids)
+          docs[rid] = stored
+    for at in 0..wanted.length
+      link = wanted[at]
+      stored = docs["${link["to"]}"]
+      linked = stored != null ? Assets.cardOf("${stored!["text"]}") : null
+      if linked != null
+        item = owners[at]
+        if not ("related" in item)
+          item["related"] = []
+        related: any[] = item["related"]!
+        related.add({ "id": link["to"], "rel": link["rel"], "title": linked!["title"], "summary": linked!["summary"] })

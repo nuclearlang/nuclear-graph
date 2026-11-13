@@ -1,0 +1,126 @@
+use os
+use shutil
+use subprocess
+use pathlib{ Path }
+
+SKIP_DIRS = ["node_modules", "build", ".venv", "target", ".git", "expected", ".dart_tool", "dist", "dist-test", "__pycache__", ".nuclear", "aprende", "CodeBuilder", "out", "results"]
+// characters of a document section's row
+MAX_SECTION = 1400
+
+sectionSize() int = MAX_SECTION
+
+// What a command prints; null when the tool is not installed.
+runCommand(cmd: string[]) string?
+  if shutil.which(cmd[0]) == null
+    return null
+  r = subprocess.run(cmd, captureOutput = true, text = true, timeout = 60)
+  out: string = r.stdout + r.stderr
+  out.trim()
+
+// What the extraction reads: the working tree, the website, `sections.toml`, and the four things it asks of this
+// machine, which whoever starts it gives (the command line gives the real ones, a test its own): a command's output,
+// the MCP server's instructions and tools ({instructions, tools: [{name, description, schema}]}), the help of this
+// package's command line, and the routes of its HTTP API ([{verb, path, scope, doc}]).
+Context(tree: Path, mcp: () => <string, any>, help: () => string, routes: () => <string, any>[], website: Path? = null, sections: <string, any>? = null, run: (cmd: string[]) => string? = runCommand)
+  problems: string[] = []
+
+  read(rel: string) string
+    path = tree.joinpath(rel)
+    path.isFile() ? path.readText(errors = "replace") : ""
+
+  // A table of `sections.toml` ({} when it has none).
+  section(name: string) any
+    held: <string, any> = sections ?? {}
+    held[name]
+
+// ---- small helpers ----
+
+// Every file under `root`, in order, without entering generated, vendored or hidden folders.
+walk(root: Path) Path[]
+  out: Path[] = []
+  for entry in os.walk(root)
+    folder: string = entry[0]
+    dirs: string[] = entry[1]
+    names: string[] = entry[2]
+    kept = dirs.filter((d) => not (d in SKIP_DIRS) and (not d.startsWith(".") or d == ".github")).sorted()
+    dirs.clear()
+    dirs.addAll(kept)
+    for name in names.sorted()
+      out.add(Path(folder).joinpath(name))
+  out
+
+// A text without the given characters at its two ends (`chars`: as inside a regular expression's `[...]`).
+stripChars(text: string, chars: string) string
+  text.replaceAll(Regex("^[${chars}]+|[${chars}]+$"), "")
+
+// A text with every run of white space as one space.
+squeeze(text: string) string
+  text.trim().split(Regex(r"\s+")).filter((w) => w.length > 0).join(" ")
+
+// What comes before the first `mark` of a text (the whole text when it has none), and what comes after it ("").
+before(text: string, mark: string) string
+  at = text.indexOf(mark)
+  at < 0 ? text : text.substring(0, at)
+
+after(text: string, mark: string) string
+  at = text.indexOf(mark)
+  at < 0 ? "" : text.substring(at + mark.length)
+
+slug(text: string, size: int = 60) string
+  whole = stripChars(text.lower().replaceAll(Regex(r"[^a-z0-9]+"), "-"), "-")
+  cut = stripChars(whole.substring(0, Math.min(size, whole.length)), "-")
+  cut.length > 0 ? cut : "x"
+
+// Markdown as plain words: no emphasis marks, a link as its text.
+plain(text: string) string
+  linked = text.replaceAll(Regex(r"\[([^\]]+)\]\([^)]*\)"), (m) => m[1] ?? "")
+  linked.replaceAll(Regex(r"\*\*|__"), "").trim()
+
+clip(text: string, size: int) string
+  whole = squeeze(text)
+  if whole.length <= size
+    return whole
+  head = whole.substring(0, size - 1)
+  at = head.lastIndexOf(" ")
+  "${at < 0 ? head : head.substring(0, at)}…"
+
+// The first sentence of a text (or its first paragraph when it has no full stop).
+firstSentence(text: string, size: int = 300) string
+  para = plain(text).trim().split("\n\n")[0]
+  m = Regex(r"(?<=[^.\d\s][.!?])\s").find("${para} ")
+  clip(m != null ? para.substring(0, m!.start) : para, size)
+
+// The cells of a markdown table row (a pipe after a backslash is a pipe inside a cell).
+cells(line: string) string[]
+  stripChars(line.trim(), "|").split(Regex(r"(?<!\\)\|")).map((c) => c.trim().replaceAll("\\|", "|"))
+
+rustText(text: string) string
+  text.replaceAll("\\\"", "\"").replaceAll("\\n", "\n").replaceAll("\\\\", "\\")
+
+// The first group of a pattern in a text ("" when it is not there).
+captured(pattern: string, text: string, multiline: boolean = false) string
+  m = Regex(pattern, multiline = multiline).find(text)
+  m != null ? m![1] ?? "" : ""
+
+// The table under a key of a map ({} when it has none), its list ([]) and its text ("").
+tableAt(value: any, key: string) <string, any>
+  if not isinstance(value, dict)
+    return {}
+  found = value.get(key)
+  isinstance(found, dict) ? found : {}
+
+listAt(value: any, key: string) any[]
+  if not isinstance(value, dict)
+    return []
+  found = value.get(key)
+  isinstance(found, list) ? found : []
+
+textAt(value: any, key: string) string
+  if not isinstance(value, dict)
+    return ""
+  found = value.get(key)
+  found == null ? "" : "${found}"
+
+// Names as code, separated by commas: `a`, `b`.
+ticked(names: string[]) string
+  names.map((n) => "`${n}`").join(", ")

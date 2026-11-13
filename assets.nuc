@@ -1,0 +1,288 @@
+use hashlib
+use pathlib{ Path }
+
+ROW_LISTS = ["keys", "asks", "tags", "platforms", "links", "sources"]
+// what a local agent may read inside a fence: Nuclear, a command line, plain text, data
+AGENT_FENCES = ["", "nuclear", "sh", "text", "console", "json"]
+// characters of the body the embedding reads, after the summary
+EMBEDDED = 1200
+
+// The lines of a text, without the line ends (none for an empty text).
+linesOf(text: string) string[]
+  if text.length == 0
+    return []
+  lines = text.replaceAll("\r\n", "\n").split("\n")
+  if lines.last.length == 0
+    lines.removeLast()
+  lines
+
+// Search results as one text for a prompt: each card, then the rows it links to in a line each.
+asText(items: <string, any>[]) string
+  parts: string[] = []
+  for item in items
+    related: <string, any>[] = item["related"] ?? []
+    lines = related.map((r) => "\n- ${r["rel"]}: ${r["title"]} — ${r["summary"]} (`${r["id"]}`)").join("")
+    parts.add("${item["text"]}${lines.length > 0 ? "\n\nRelated:${lines}" : ""}")
+  parts.join("\n\n---\n\n")
+
+// A row of an asset file with where it comes from (`generated` or `curated`).
+Loaded(row: <string, any>, origin: string)
+
+// The rows of the knowledge base (ADR-0104): how an asset file is read, what makes a row valid, what of a row is
+// embedded and what is stored. An asset file is `assets/<shelf>/<name>.json`: `{shelf, origin, about, rows}`; a file
+// `<name>.overlay.json` holds hand-written fields that the build merges into the generated rows of `<name>.json`.
+Assets
+  // A body is a text or a list of lines (lines read and diff better inside JSON).
+  static textOf(value: any) string
+    if value is any[]
+      lines: string[] = value
+      return lines.join("\n")
+    value == null ? "" : "${value}"
+
+  static listOf(value: any) any[]
+    if value is any[]
+      items: any[] = value
+      return items.copy()
+    []
+
+  static mapOf(value: any) <string, any>
+    if isinstance(value, dict)
+      found: <string, any> = value
+      return { ...found }
+    {}
+
+  // The row with every field present.
+  static normal(row: <string, any>) <string, any>
+    out: <string, any> = { ...row }
+    out["body"] = Assets.textOf(row["body"]).trim()
+    out["summary"] = Assets.textOf(row["summary"]).trim()
+    for name in ROW_LISTS
+      out[name] = Assets.listOf(row[name])
+    out["agents"] = row["agents"] != false
+    out["meta"] = Assets.mapOf(row["meta"])
+    out["data"] = Assets.mapOf(row["data"])
+    out
+
+  // The language of the fence a line opens.
+  static fenceOf(line: string) string
+    line.trim().substring(3).trim().lower()
+
+  // The text without the code blocks of a target language (```python, ```dart, ```typescript...) and without what
+  // a dialect writes underneath a word (the `**Underneath (dialect):**` note): what a local agent reads.
+  static nuclearOnly(text: string) string
+    out: string[] = []
+    keep = true
+    fence = false
+    for line in linesOf(text)
+      if line.startsWith("**Underneath (")
+        continue
+      if line.trimStart().startsWith("```")
+        if not fence
+          keep = Assets.fenceOf(line) in AGENT_FENCES
+        fence = not fence
+        if keep
+          out.add(line)
+        continue
+      if keep or not fence
+        out.add(line)
+    out.join("\n")
+
+  // The languages of the fences a local agent must not read.
+  static foreignFences(text: string) string[]
+    found: string[] = []
+    fence = false
+    for line in linesOf(text)
+      if line.trimStart().startsWith("```")
+        if not fence and not (Assets.fenceOf(line) in AGENT_FENCES)
+          found.add(Assets.fenceOf(line))
+        fence = not fence
+    found
+
+  static rowHash(row: <string, any>) string
+    dumped: string = json.dumps(Assets.normal(row), sortKeys = true, ensureAscii = false)
+    hashlib.sha1(dumped.toBytes()).hexdigest()
+
+  static texts(value: any) boolean
+    if not (value is any[])
+      return false
+    items: any[] = value
+    items.length > 0 and items.all((v) => v is string)
+
+  // Everything that makes the base invalid: a row is fixed, never ingested half right.
+  static problems(byShelf: <string, <string, any>[]>) string[]
+    out: string[] = []
+    seen: <string, string> = {}
+    valid = Regex(r"^[a-z-]+:[A-Za-z0-9_.@/#+-]+$")
+    known: <string, Shelf> = shelfTable()
+    for shelf, rows in byShelf
+      spec = known[shelf]
+      if spec == null
+        out.add("${shelf}: not a shelf (shelves: ${shelfTable().keys.join(", ")})")
+        continue
+      for raw in rows
+        row: <string, any> = Assets.normal(raw)
+        rid = "${row["id"] ?? ""}"
+        where = "${shelf}/${rid.length > 0 ? rid : "?"}"
+        if not valid.test(rid)
+          out.add("${where}: an id is `<prefix>:<name>` (letters, digits, . _ - / # @ +)")
+          continue
+        if rid in seen
+          out.add("${where}: the id is also in ${seen[rid]}")
+        seen[rid] = shelf
+        if shelfOf(rid) != shelf
+          out.add("${where}: the prefix `${rid.split(":")[0]}` is not of this shelf (${spec!.prefixes.join(", ")})")
+        if not (row["type"] in spec!.types)
+          out.add("${where}: type `${row["type"]}` is not of this shelf (${spec!.types.join(", ")})")
+        title = "${row["title"] ?? ""}"
+        if title.length < 3 or title.length > 140
+          out.add("${where}: the title has ${title.length} characters (3 to 140)")
+        summary: string = row["summary"]!
+        if summary.length == 0 or summary.length > 420
+          out.add("${where}: the summary has ${summary.length} characters (1 to 420)")
+        body: string = row["body"]!
+        if body.length == 0
+          out.add("${where}: no body")
+        for name in ["keys", "asks", "tags", "platforms", "sources"]
+          values: any[] = row[name]!
+          if values.any((v) => not (v is string) or v == "")
+            out.add("${where}: `${name}` is a list of texts")
+        keys: string[] = row["keys"]!
+        if keys.any((k) => k != k.lower())
+          out.add("${where}: keys are written in lower case")
+        platforms: string[] = row["platforms"]!
+        unknown = platforms.filter((p) => not (p in platformNames()))
+        if unknown.length > 0
+          out.add("${where}: unknown platform ${unknown} (${platformNames().join(", ")})")
+        meta: <string, any> = row["meta"]!
+        alien = meta.keys.filter((k) => not (k in spec!.meta))
+        if alien.length > 0
+          out.add("${where}: meta ${alien} is not of this shelf (${spec!.meta.length > 0 ? spec!.meta.join(", ") : "none"})")
+        if meta.values.any((v) => not (v is string or v is int or v is double or v is boolean) and not Assets.texts(v))
+          out.add("${where}: a meta value is a text, a number, a boolean or a list of texts")
+        foreign: string[] = Assets.foreignFences(body)
+        if row["agents"] == true and foreign.length > 0
+          out.add("${where}: a row the local agents read has code of ${foreign.unique().sorted()}: Nuclear only, or `agents: false`")
+        links: any[] = row["links"]!
+        for link in links
+          if not isinstance(link, dict) or not link.get("rel") or not link.get("to")
+            out.add("${where}: a link is {rel, to}")
+    for shelf, rows in byShelf
+      for raw in rows
+        targets: any[] = Assets.normal(raw)["links"]!
+        for link in targets
+          if isinstance(link, dict) and link.get("to") and not (link["to"] in seen)
+            out.add("${shelf}/${raw["id"]}: links to `${link["to"]}`, which no row has")
+    out
+
+  // What is stored (encrypted) for a row: the card a search answers.
+  static envelope(row: <string, any>, shelf: string) string
+    r: <string, any> = Assets.normal(row)
+    card = { "v": 1, "id": r["id"], "shelf": shelf, "type": r["type"], "title": r["title"], "summary": r["summary"], "body": r["body"], "links": r["links"], "sources": r["sources"], "data": r["data"] }
+    json.dumps(card, ensureAscii = false)
+
+  // The card of a stored document; null for a plain text (what an agent kept at run time).
+  static cardOf(document: string) <string, any>?
+    if not document.startsWith("{\"v\": 1,")
+      return null
+    try
+      json.loads(document)
+    catch e
+      null
+
+  // A card as the text a model reads.
+  static render(card: <string, any>) string
+    body: string = card["body"]!
+    summary: string = card["summary"]!
+    lead = body.startsWith(summary.substring(0, Math.min(60, summary.length))) ? "" : "${summary}\n\n"
+    "[${card["shelf"]}/${card["type"]}] ${card["title"]}\n\n${lead}${body}"
+
+  // The metadata of a row in Chroma: names, keys and filters, never the text. A list is never stored empty.
+  static metadata(row: <string, any>, shelf: string, origin: string, rev: int = 0) <string, any>
+    r: <string, any> = Assets.normal(row)
+    platforms: string[] = r["platforms"]!
+    sources: string[] = r["sources"]!
+    meta: <string, any> = {
+      "card": r["id"], "facet": "card", "type": r["type"], "title": r["title"], "agents": r["agents"],
+      "platforms": platforms.length > 0 ? platforms : ["all"], "origin": origin, "source": sources.length > 0 ? sources[0] : "",
+      "hash": Assets.rowHash(row), "rev": rev,
+    }
+    links: <string, any>[] = r["links"]!
+    lists: <string, string[]> = { "keys": r["keys"]!, "tags": r["tags"]!, "links": links.map((link) => "${link["to"]}") }
+    for name, values in lists
+      if values.length > 0
+        meta[name] = values.unique().sorted()
+    own: <string, any> = r["meta"]!
+    for key, value in own
+      meta[key] = value
+    meta
+
+  // What a row becomes in its collection: the card (found by its title, summary and the start of its body) and one
+  // entry per question it answers. Each is {id, title, embed, document, meta}.
+  static facets(row: <string, any>, shelf: string, origin: string, rev: int = 0) <string, any>[]
+    r: <string, any> = Assets.normal(row)
+    meta: <string, any> = Assets.metadata(row, shelf, origin, rev)
+    body: string = r["body"]!
+    out: <string, any>[] = [{ "id": r["id"], "title": r["title"], "embed": "${r["summary"]}\n\n${body.substring(0, Math.min(EMBEDDED, body.length))}".trim(), "document": Assets.envelope(row, shelf), "meta": meta }]
+    asks: string[] = r["asks"]!
+    n = 0
+    for ask in asks
+      n += 1
+      own: <string, any> = {}
+      for key, value in meta
+        if key != "keys"
+          own[key] = value
+      own["facet"] = "ask"
+      own["hash"] = "${meta["hash"]}:q"
+      // a question is embedded as a search is, so the same question asked again is the closest thing to it
+      out.add({ "id": "${r["id"]}#ask${n}", "embed": ask, "query": true, "document": ask, "meta": own })
+    out
+
+  static readFile(path: Path) <string, any>
+    data = json.loads(path.readText())
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list)
+      throw ValueError("${path}: an asset file is {shelf, origin, about, rows: [...]}")
+    data
+
+  // Every row of `<folder>/assets` by shelf, each with its origin (`generated` or `curated`).
+  static load(folder: Path) <string, Loaded[]>
+    out: <string, Loaded[]> = {}
+    files: Path[] = list(folder.joinpath("assets").glob("*/*.json"))
+    for path in files.sorted()
+      name: string = path.name
+      if name.endsWith(".overlay.json")
+        continue
+      data: <string, any> = Assets.readFile(path)
+      shelf: string = data["shelf"] ?? path.parent.name
+      if not (shelf in out)
+        out[shelf] = []
+      rows: <string, any>[] = data["rows"]!
+      for row in rows
+        out[shelf]!.add(Loaded(row, "${data["origin"] ?? "curated"}"))
+    out
+
+  static blank(value: any) boolean
+    value == null or value == "" or value == [] or value == {}
+
+  // The row as it is written: a body of several lines as a list of lines, and no empty field.
+  static lined(row: <string, any>) <string, any>
+    out: <string, any> = {}
+    for key, value in row
+      if not Assets.blank(value) and not (key == "agents" and value == true)
+        out[key] = value
+    body = Assets.textOf(row["body"]).trim()
+    out["body"] = "\n" in body ? body.split("\n") : body
+    out
+
+  // Writes an asset file with its rows sorted by id; false when it already says the same.
+  static writeFile(path: Path, shelf: string, origin: string, about: string, rows: <string, any>[], generator: string = "") boolean
+    data: <string, any> = { "shelf": shelf, "origin": origin }
+    if generator.length > 0
+      data["generator"] = generator
+    data["about"] = about
+    data["rows"] = rows.sortedBy((r) => "${r["id"]}").map((r) => Assets.lined(r))
+    text: string = json.dumps(data, indent = 1, ensureAscii = false) + "\n"
+    if path.isFile() and path.readText() == text
+      return false
+    path.parent.mkdir(parents = true, existOk = true)
+    path.writeText(text)
+    true

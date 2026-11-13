@@ -1,0 +1,162 @@
+// How close (by meaning) a question must be to an exact question of the catalogue for its query to be run when no
+// word of the question names what it asks about; a query one of whose parameters the question itself names is run
+// from further away. Both were measured with the questions of `questions.toml`.
+NEAR = 0.32
+NAMED = 0.45
+// How much further than the closest exact question another one may be and still be run with it.
+BESIDE = 0.05
+// The most rows of one query, queries of one answer and characters of facts a prompt gets.
+MOST_ROWS = 80
+MOST_QUERIES = 3
+MOST_FACTS = 9000
+
+// The plan of an answer (the query planner of the Smart Graph): what a question needs from the graph before any
+// model reads it. A question with one right answer (every command of a tool, the parameters of an MCP tool, the
+// commands that write a kind) is not searched by meaning: it is matched to its row of the catalogue of exact
+// questions (by meaning and by the names it writes), the names it writes fill the query's parameters, and the query
+// runs over the exact facts (SQLite). What is left (what something is, why, how it is done) is searched in the
+// shelves as always, and the shelves decide which of the two a question is: a query runs only when its exact
+// question is closer to the question than the closest card. A model then writes the answer from both: it copies the
+// facts, it never recalls them.
+Planner
+  // The values a parameter takes from words: each [what people write, the value it means], longest first.
+  static said(facts: Facts, param: <string, any>) string[][]
+    sql = "${param["values"] ?? ""}"
+    if sql.length == 0
+      return []
+    pairs: string[][] = facts.pairs(sql)
+    pairs.filter((pair: string[]) => pair[0].length > 0).sortedBy((pair: string[]) => -pair[0].length)
+
+  // The values of a parameter that some words name (`grams`: every run of words of a text, in lower case), in the
+  // order the words come.
+  static named(pairs: string[][], grams: string[]) string[]
+    found: string[] = []
+    for gram in grams
+      for pair in pairs
+        if pair[0].lower() == gram and not (pair[1] in found)
+          found.add(pair[1])
+    found
+
+  // Every run of 1 to 4 words of a text, in lower case: the names it may be writing (`use case`, `gen resource`).
+  static runs(text: string) string[]
+    words: string[] = Retrieve.wordsOf(text)
+    out: string[] = []
+    for n in [4, 3, 2, 1]
+      for i in 0..Math.max(0, words.length - n + 1)
+        out.add(words.slice(i, i + n).join(" "))
+    out.unique()
+
+  // The user's own earlier messages of a conversation (`you: ...` lines), newest first.
+  static earlier(history: string) string[]
+    mine: string[] = []
+    for line in linesOf(history)
+      if line.startsWith("you:")
+        mine.add(line.substring(4).trim())
+    mine.reversed()
+
+  // The rows of a query as lines a model copies: the columns once, then a line per row.
+  static shown(columns: string[], rows: <string, any>[]) string
+    lines = ["columns: ${columns.join(" | ")}"]
+    for row in rows
+      lines.add("- ${row.values.map((v) => "${v ?? ""}".replaceAll("\n", " ")).join(" | ")}")
+    lines.join("\n")
+
+  // The exact questions of the catalogue a text is close to, each with its parameters filled from the names the
+  // question writes (`grams`), the project's platform and the messages before it (`past`): the ones that can run are
+  // added to `scored`, the ones that lack a name to `needs`.
+  static choose(store: Store, facts: Facts, asked: string, grams: string[], past: string[], platform: string, scored: <string, any>[], needs: string[]) void
+    close: <string, any>[] = Retrieve.search(store, asked, [exactShelf()], k = 6)
+    for item in close
+      card: <string, any> = item["card"] ?? {}
+      data: <string, any> = card["data"] ?? {}
+      params: <string, any>[] = data["params"] ?? []
+      values: <string, any> = {}
+      own = 0
+      missing: string[] = []
+      several: string[] = []
+      multiple = ""
+      for param in params
+        name = "${param["name"]}"
+        pairs = Planner.said(facts, param)
+        fits: string[] = Planner.named(pairs, grams)
+        if fits.length > 0
+          own += 1
+        if fits.length == 0 and param["from"] == "platform" and platform.length > 0
+          fits = [platform]
+        at = 0
+        while fits.length == 0 and at < past.length
+          fits = Planner.named(pairs, Planner.runs(past[at]))
+          at += 1
+        if fits.length > 0
+          values[name] = fits[0]
+          if fits.length > 1 and param["required"] == true and several.length == 0
+            several = fits
+            multiple = name
+        else if param["required"] == true
+          missing.add(name)
+        else
+          values[name] = "${param["default"] ?? ""}"
+      distance: double = item["distance"] ?? 1.0
+      if missing.length > 0
+        if distance <= NAMED
+          needs.add("${card["title"]}: it needs ${missing.join(", ")}")
+        continue
+      if distance <= (own > 0 ? NAMED : NEAR)
+        scored.add({ "id": item["id"], "title": card["title"], "distance": distance, "own": own, "sql": data["sql"], "columns": data["columns"] ?? [], "values": values, "several": several, "multiple": multiple })
+
+  // The plan of an answer to `question`: {exact, needs, cards, text}. `exact`: the queries that were run, each {id,
+  // title, why, params, columns, rows}; `needs`: the exact questions that were close but lack a name ("which
+  // kind?"); `cards`: what the shelves answer by meaning; `text`: all of it as the text a prompt gets. `platform`:
+  // the project's; `history`: the conversation so far (`you: ...` / `agent: ...` lines), read for the names a
+  // follow-up leaves out; `agents`: only what a local agent may read.
+  static answer(store: Store, facts: Facts, question: string, platform: string = "", history: string = "", agents: boolean = true, k: int = 4) <string, any>
+    exact: <string, any>[] = []
+    needs: string[] = []
+    // what the shelves are searched with: the question, or the question after the message it follows
+    read = question
+    scored: <string, any>[] = []
+    if facts.filled()
+      past: string[] = Planner.earlier(history)
+      grams: string[] = Planner.runs(question)
+      // a follow-up ("describe each of those") is close to no exact question by itself: when the question alone
+      // chooses none, it is read once more with the message before it
+      texts = past.length > 0 ? [question, "${past[0]} ${question}"] : [question]
+      for asked in texts
+        if scored.length > 0
+          break
+        needs = []
+        read = asked
+        Planner.choose(store, facts, asked, grams, past, platform, scored, needs)
+    cards = Retrieve.search(store, read, searchedShelves(), k = k, platform = platform, agents = agents, expand = true)
+    // a question a card answers closer than any exact question of the catalogue is not one with one right answer:
+    // "what is nuclear" writes the name of a tool and of a component, and asks for the list of neither
+    distances: double[] = cards.map((card) => card["distance"]!)
+    nearest: double = distances.min() ?? 1.0
+    ranked = scored.filter((q) => q["distance"]! < nearest).sortedBy((q) => q["distance"]!)
+    closest: double = ranked.length > 0 ? ranked[0]["distance"]! : 0.0
+    for chosen in ranked.filter((q) => q["distance"]! <= closest + BESIDE).take(MOST_QUERIES)
+      base: <string, any> = chosen["values"]!
+      many: string[] = chosen["several"]!
+      name = "${chosen["multiple"]}"
+      // a question that names several values of one parameter ("a use case and a repository") is asked for each
+      each: string[] = many.length > 1 ? many.take(3) : [""]
+      for value in each
+        given: <string, any> = { ...base }
+        if value.length > 0
+          given[name] = value
+        rows: <string, any>[] = facts.run("${chosen["sql"]}", given)
+        told = given.keys.filter((key) => "${given[key]}".length > 0).map((key) => "${key} = ${given[key]}").join(", ")
+        exact.add({ "id": chosen["id"], "title": chosen["title"], "why": "${chosen["own"]} of its names are in the question; ${chosen["distance"]} from it by meaning", "params": given, "told": told, "columns": chosen["columns"], "rows": rows.take(MOST_ROWS), "total": rows.length })
+    parts: string[] = []
+    size = 0
+    for query in exact
+      held: <string, any>[] = query["rows"]!
+      if held.length == 0
+        continue
+      told = "${query["told"]}"
+      total: int = query["total"]!
+      block = "### ${query["title"]}${told.length > 0 ? " (${told})" : ""}: ${total} rows${total > held.length ? ", the first ${held.length} shown" : ""}\n\n${Planner.shown(query["columns"]!, held)}"
+      if size + block.length <= MOST_FACTS or parts.length == 0
+        parts.add(block.substring(0, Math.min(block.length, MOST_FACTS)))
+        size += block.length
+    { "question": question, "exact": exact, "needs": needs, "cards": cards, "facts": parts.join("\n\n"), "knowledge": asText(cards) }

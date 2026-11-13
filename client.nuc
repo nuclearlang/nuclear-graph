@@ -1,0 +1,148 @@
+use os
+use httpx
+use httpx{ Response }
+use urllib/parse{ quote }
+
+// The token of a client of the graph: `NUCLEAR_GRAPH_TOKEN`, else the one `nuclear-graph connect <client>` stored
+// (in the keyring, or in a file of the data folder only the owner reads).
+tokenOf(client: string) string
+  token: string = os.environ.get("NUCLEAR_GRAPH_TOKEN") ?? ""
+  if token.length == 0
+    token = Secrets.keyringGet("client:${client}") ?? ""
+  if token.length == 0
+    file = Paths.home().joinpath(".client-${client}")
+    if file.isFile()
+      text: string = file.readText()
+      token = text.trim()
+  if token.length == 0
+    throw PermissionError("'${client}' has no access to the Nuclear Smart Graph: run `nuclear-graph connect ${client}` and allow it")
+  token
+
+// The client of the graph for other programs (the local agents, the MCP server): it reads and writes the Nuclear
+// Smart Graph. Answers are plain text, shaped to be put in a prompt.
+GraphClient(client: string = "nuclear-developer", url: string = "")
+  call(method: string, path: string, body: <string, any>? = null) any
+    http = httpx.AsyncClient(baseUrl = url.length > 0 ? url : graphUrl(), timeout = 120)
+    try
+      r: Response = ~http.request(method, path, json = body, headers = { "Authorization": "Bearer ${tokenOf(client)}" })
+      if r.statusCode >= 400
+        throw RuntimeError("graph ${path}: ${r.statusCode} ${r.text}")
+      r.json()
+    finally
+      ~http.aclose()
+
+  // The cards that answer a query. `shelves`: one shelf or several separated by commas ("" = every shelf of the
+  // knowledge base). `kind` and `type` filter by those fields of a row; `kinds` keeps the rows that apply to a kind
+  // (the pitfalls of `usecase`).
+  items(query: string, shelves: string = "", k: int = 5, platform: string = "", kind: string = "", type: string = "", agents: boolean = false, expand: boolean = false, kinds: string = "") <string, any>[]
+    where: <string, any> = {}
+    filters: <string, string> = { "kind": kind, "type": type, "kinds": kinds }
+    for key, value in filters
+      if value.length > 0
+        where[key] = value
+    among = shelves.split(",").map((s) => s.trim()).filter((s: string) => s.length > 0)
+    body: <string, any> = { "query": query, "shelves": among.length > 0 ? among : null, "k": k, "platform": platform, "agents": agents, "where": where.length > 0 ? where : null, "expand": expand }
+    found = ~call("POST", "/v1/search", body)
+    found["items"]
+
+  // The closest pieces of knowledge, as one text for a prompt. A local agent searches with `agents = true` and its
+  // `platform`: Nuclear and Dragonfly only, nothing of a target language.
+  search(query: string, shelves: string = "", k: int = 5, platform: string = "", kind: string = "", type: string = "", agents: boolean = false, expand: boolean = false, kinds: string = "") string
+    asText(~items(query, shelves, k, platform, kind, type, agents, expand, kinds))
+
+  // Validated Nuclear closest to `task`: files of the example projects (`type = "file"`), solved tasks (`type =
+  // "solved"`) or both; `kind` keeps one kind (usecase, repository...).
+  examples(task: string, platform: string = "", k: int = 2, kind: string = "", type: string = "") string
+    asText(~items(task, "examples", k, platform, kind, type, true))
+
+  // The mistakes small models repeat with a kind, all of them: the `full` closest to the task as whole cards (the
+  // right shape to copy), the others in one line each (the rule).
+  pitfalls(task: string, kind: string, platform: string = "", full: int = 2) string
+    found: <string, any>[] = ~items(task, "errors", 12, platform, type = "pitfall", agents = true, kinds = kind)
+    rules: string[] = []
+    for item in found.skip(full)
+      held = item["card"]
+      if held != null
+        rules.add("- ${held["summary"]}")
+    "${asText(found.take(full))}${rules.length > 0 ? "\n\n---\n\nAlso with this kind:\n\n${rules.join("\n")}" : ""}"
+
+  // One row of the knowledge base by its id (`error:N0114`, `kind:backend.usecase`), with a line for each row it
+  // links to (`related`); "" when there is no such row.
+  card(id: string, related: boolean = true) string
+    try
+      found: <string, any> = ~call("GET", "/v1/cards/${quote(id, safe = ":")}")
+      if not related
+        found.remove("related")
+      asText([found])
+    catch e
+      ""
+
+  // A row in one line: `title — summary (`id`)`; "" when there is no such row.
+  brief(id: string) string
+    try
+      found: <string, any> = ~call("GET", "/v1/cards/${quote(id, safe = ":")}")
+      held: <string, any> = found["card"] ?? {}
+      "${held["title"] ?? id} — ${held["summary"] ?? ""} (`${id}`)"
+    catch e
+      ""
+
+  // What of a spec or a task the platform cannot do yet, limits, or was never run for real (the capabilities rows
+  // whose trigger words the text writes), one line each: `title — summary (`id`, because it says "word")`.
+  applies(text: string, platform: string = "") string[]
+    reply: <string, any> = ~call("POST", "/v1/applies", { "text": text.substring(0, Math.min(40000, text.length)), "platform": platform })
+    found: <string, any>[] = reply["items"]!
+    found.map((i) => "${i["title"]} — ${i["summary"]} (`${i["id"]}`, because it says \"${i["trigger"]}\")")
+
+  // The strategy of a request (which kind of request it is, and the plan of that kind), each field a text: `id`,
+  // `title`, `summary`, `why` (the signs that chose it), `plan` (the card), `mode` (write, repair, verify, review,
+  // answer, commands, lead), `stages` (the Loop's stages it runs) and `generators`, separated by commas, `pieces`
+  // (where its pieces come from: plan, declaring, naming, none), `lead` (local or frontier), `needs` (the facts it
+  // cannot start without, one `name=question` per line) and `second` (the next closest). `existing` and `new`: the
+  // declarations the request names that the project has, and the ones it has not. `runnable`: for a run of the
+  // Loop. `only`: the strategy the request itself names. {} when the graph has no strategy.
+  strategy(text: string, platform: string = "", existing: string[]? = null, new: string[]? = null, runnable: boolean = false, only: string = "") <string, string>
+    body: <string, any> = { "text": text.substring(0, Math.min(40000, text.length)), "platform": platform, "existing": existing, "new": new, "runnable": runnable, "only": only }
+    reply: <string, any> = ~call("POST", "/v1/strategy", body)
+    found: <string, any>[] = reply["items"]!
+    if found.length == 0
+      return {}
+    best = found[0]
+    data: <string, any> = best["data"] ?? {}
+    stages: string[] = data["stages"] ?? []
+    generators: string[] = data["generators"] ?? []
+    needs: <string, any> = data["needs"] ?? {}
+    {
+      "id": "${best["id"]}", "title": "${best["title"]}", "summary": "${best["summary"]}", "why": "${best["why"]}", "plan": "${best["text"]}",
+      "mode": "${data["mode"] ?? "write"}", "stages": stages.join(","), "generators": generators.join(","), "pieces": "${data["pieces"] ?? "plan"}",
+      "lead": "${data["lead"] ?? "local"}", "needs": needs.keys.map((name) => "${name}=${needs[name]}").join("\n"),
+      "second": found.length > 1 ? "${found[1]["id"]}" : "",
+    }
+
+  // What the graph gives for a question before a model answers it (its query planner; no model is asked), each a
+  // text for a prompt: `facts` (the exact answer of every question with one right answer the question is: the rows of
+  // the graph's database, whole), `knowledge` (the cards the shelves answer by meaning) and `needs` (the exact
+  // questions it is close to that lack a name). `history`: the conversation so far (`you: ...` / `agent: ...`
+  // lines), read for the names a follow-up leaves out.
+  answer(question: string, platform: string = "", history: string = "", agents: boolean = true, k: int = 4) <string, string>
+    found: <string, any> = ~call("POST", "/v1/answer", { "question": question.substring(0, Math.min(4000, question.length)), "platform": platform, "history": history, "agents": agents, "k": k })
+    needs: string[] = found["needs"] ?? []
+    { "facts": "${found["facts"] ?? ""}", "knowledge": "${found["knowledge"] ?? ""}", "needs": needs.join("\n") }
+
+  // Every way a kind of the platform is written, in lower case, and the kind it means: `use case` → `usecase`,
+  // `application component` → `appcomponent`, `usecase` → `usecase`.
+  kinds(platform: string) <string, string>
+    ~call("GET", "/v1/kinds/${platform}")
+
+  // The validated prompt of a use case (feature, refactor, bug, docs, diagram, test, security, piece).
+  prompt(useCase: string) string
+    found = ~call("GET", "/v1/prompts/${useCase}")
+    found["text"]
+
+  // Keeps a piece of knowledge about a project (`memory`) or a solved example (`examples`) for later.
+  remember(id: string, text: string, collection: string = "memory", project: string = "", kind: string = "note", platform: string = "") string
+    meta = { "project": project, "kind": kind, "platform": platform }
+    found = ~call("POST", "/v1/documents", { "collection": collection, "id": id, "text": text, "meta": meta })
+    found["id"]
+
+  stats() <string, any>
+    ~call("GET", "/v1/stats")

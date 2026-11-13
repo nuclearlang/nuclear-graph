@@ -1,0 +1,207 @@
+use os
+use chromadb
+use numpy
+use chromadb/config{ Settings }
+use chromadb/api/models/Collection{ Collection }
+use ollama
+
+EMBED_MODEL = os.environ.get("NUCLEAR_GRAPH_EMBED") ?? "embeddinggemma"
+OLLAMA_URL = os.environ.get("OLLAMA_URL") ?? "http://localhost:11434"
+
+// EmbeddingGemma's prompt of a document: its title, then its text.
+asDocument(title: string, text: string) string
+  "title: ${title.length > 0 ? title : "none"} | text: ${text}"
+
+// EmbeddingGemma's prompt of a search.
+asQuery(text: string) string
+  "task: search result | query: ${text}"
+
+// The vectors of texts already shaped for the model (`asDocument`, `asQuery`), by the local embeddings model.
+ollamaEmbed(shaped: string[]) double[][]
+  client = ollama.Client(host = OLLAMA_URL)
+  out: double[][] = []
+  at = 0
+  while at < shaped.length
+    got: any = client.embed(model = EMBED_MODEL, input = shaped.slice(at, at + 32))
+    for vector in got.embeddings
+      out.add(list(vector))
+    at += 32
+  out
+
+// What a read of a collection with its vectors becomes for a search: each item (id, metadata) with how far its vector
+// is from `vector` by direction (cosine: 0 is the same one), the closest first.
+closest(got: any, vector: double[]) <string, any>[]
+  ids: string[] = got["ids"]
+  if ids.length == 0
+    return []
+  metas: any[] = got["metadatas"] ?? []
+  // one row per item (a numpy matrix): the whole shelf is measured at once
+  kept: any = got["embeddings"]
+  length = Math.sqrt(vector.map((x) => x * x).sum())
+  lengths: any = numpy.linalg.norm(kept, axis = 1)
+  apart: any = 1.0 - kept.dot(vector) / (lengths * length)
+  far: double[] = apart.tolist()
+  out: <string, any>[] = []
+  for i in 0..ids.length
+    out.add({ "id": ids[i], "meta": metas[i], "distance": (far[i] * 10000).round() / 10000 })
+  out.sortedBy((item) => item["distance"]!)
+
+// The first of two values that is a text with something in it.
+textOr(first: any, second: any) string
+  one = "${first ?? ""}"
+  one.length > 0 ? one : "${second ?? ""}"
+
+// What Chroma keeps as metadata: texts, numbers, booleans and lists of texts that are not empty.
+storable(meta: <string, any>) <string, any>
+  out: <string, any> = {}
+  for key, value in meta
+    if value is string or value is int or value is double or value is boolean or Assets.texts(value)
+      out[key] = value
+  out
+
+// The graph's store: one Chroma collection per shelf (ADR-0104), whose documents are encrypted and whose vectors
+// come from a local embeddings model (Ollama). Only the server process opens it.
+//
+// A row's metadata is in clear (ids, names, keys, filters: what Chroma searches by); its text is sealed. The shelves
+// of the knowledge base are made by `ingest`; `prompts` holds the prompt files of this package and `memory` what an
+// agent decided to keep about a project while working on it.
+Store
+  client: any
+  box: Box
+  embedder: (shaped: string[]) => double[][]
+  cols: <string, Collection> = {}
+
+  // `path`: the folder of the vectors (the data folder's `db` when left out); `key`: the key of the documents (the
+  // keyring's when left out); `embed`: what gives the vectors (the local embeddings model when left out).
+  (path: string = "", key: Bytes? = null, embed: ((shaped: string[]) => double[][])? = null)
+    client = chromadb.PersistentClient(path = path.length > 0 ? path : "${Paths.db()}", settings = Settings(anonymizedTelemetry = false, allowReset = false))
+    box = Box(key ?? Secrets.key())
+    embedder = embed ?? ollamaEmbed
+    for name in collections()
+      cols[name] = client.getOrCreateCollection(name, metadata = { "hnsw:space": "cosine" }, embeddingFunction = null)
+
+  col(name: string) Collection
+    if not (name in cols)
+      throw KeyError("unknown collection '${name}' (collections: ${collections().join(", ")})")
+    cols[name]!
+
+  // ---- writing ----
+
+  // Adds or replaces items. Each is {id, document, meta} (a list `[id, text, meta]` is the same); what is embedded
+  // is `embed` under `title` when given, else the document; with `query`, `embed` is embedded as a search is (a
+  // question a row answers). The document is stored encrypted.
+  put(collection: string, items: any[]) int
+    rows: <string, any>[] = []
+    for item in items
+      rows.add(isinstance(item, dict) ? item : { "id": item[0], "document": item[1], "meta": item[2] })
+    if rows.length == 0
+      return 0
+    shaped: string[] = []
+    for row in rows
+      meta: <string, any> = row["meta"]!
+      shaped.add(row["query"] == true ? asQuery("${row["embed"]}") : asDocument(textOr(row["title"], meta["title"]), textOr(row["embed"], row["document"])))
+    vectors: any = embedder(shaped)
+    col(collection).upsert(
+      ids = rows.map((r) => "${r["id"]}"),
+      embeddings = vectors,
+      documents = rows.map((r) => box.seal("${r["document"]}")),
+      metadatas = rows.map((r) => storable(r["meta"]!)),
+    )
+    rows.length
+
+  delete(collection: string, ids: string[]) void
+    if ids.length > 0
+      col(collection).delete(ids = ids.copy())
+
+  // Removes the collections of before the shelves (ADR-0104).
+  dropLegacy() string[]
+    gone: string[] = []
+    for name in legacyCollections()
+      try
+        client.deleteCollection(name)
+        gone.add(name)
+      catch e
+        // it was not there
+        continue
+    gone
+
+  // ---- versions ----
+
+  // The schema and the revision of the knowledge base this store holds (0: never ingested).
+  version() <string, int>
+    meta: <string, any> = client.getCollection(shelfTable().keys[0]).metadata ?? {}
+    schema: int = meta["schema"] ?? 0
+    revision: int = meta["revision"] ?? 0
+    { "schema": schema, "revision": revision }
+
+  setVersion(schema: int, revision: int) void
+    for name in shelfTable().keys
+      col(name).modify(metadata = { "schema": schema, "revision": revision })
+
+  // ---- reading ----
+
+  // id → content hash of the items of a collection (to embed again only what changed).
+  hashes(collection: string, where: <string, any>? = null) <string, string>
+    got: any = col(collection).get(where = where, include = ["metadatas"])
+    ids: string[] = got["ids"]
+    metas: <string, any>[] = got["metadatas"] ?? []
+    out: <string, string> = {}
+    for i in 0..Math.min(ids.length, metas.length)
+      out[ids[i]] = "${metas[i]["hash"] ?? ""}"
+    out
+
+  embedQuery(query: string) double[]
+    embedder([asQuery(query)])[0]
+
+  // The `k` items closest to a vector among the ones a filter matches: id, metadata and distance (0 is the same
+  // meaning), without their text. Exact: the vector the store keeps of each of them is compared (a shelf holds
+  // hundreds of items: milliseconds). The store's own index is approximate and, once items were replaced, does not
+  // reach every item it holds: it is not asked.
+  near(collection: string, vector: double[], k: int, where: <string, any>? = null) <string, any>[]
+    closest(col(collection).get(where = where, include = ["metadatas", "embeddings"]), vector).take(k)
+
+  // How far each of these items is from a vector, as `near` gives them.
+  measure(collection: string, vector: double[], ids: string[]) <string, any>[]
+    if ids.length == 0
+      return []
+    closest(col(collection).get(ids = ids.unique(), include = ["metadatas", "embeddings"]), vector)
+
+  // The items a filter matches: id and metadata.
+  where(collection: string, where: <string, any>, limit: int? = null) <string, any>[]
+    got: any = col(collection).get(where = where, limit = limit, include = ["metadatas"])
+    ids: string[] = got["ids"]
+    metas: any[] = got["metadatas"] ?? []
+    out: <string, any>[] = []
+    for i in 0..Math.min(ids.length, metas.length)
+      out.add({ "id": ids[i], "meta": metas[i] })
+    out
+
+  // id → {text, meta} of the items with these ids (the ones that exist).
+  documents(collection: string, ids: string[]) <string, <string, any>>
+    out: <string, <string, any>> = {}
+    if ids.length == 0
+      return out
+    got: any = col(collection).get(ids = ids.unique(), include = ["documents", "metadatas"])
+    found: string[] = got["ids"]
+    texts: string[] = got["documents"] ?? []
+    metas: any[] = got["metadatas"] ?? []
+    for i in 0..Math.min(found.length, Math.min(texts.length, metas.length))
+      out[found[i]] = { "text": box.open(texts[i]), "meta": metas[i] }
+    out
+
+  // The items a filter matches, with their text.
+  read(collection: string, where: <string, any>) <string, any>[]
+    got: any = col(collection).get(where = where, include = ["documents", "metadatas"])
+    found: string[] = got["ids"]
+    texts: string[] = got["documents"] ?? []
+    metas: any[] = got["metadatas"] ?? []
+    out: <string, any>[] = []
+    for i in 0..Math.min(found.length, Math.min(texts.length, metas.length))
+      out.add({ "id": found[i], "text": box.open(texts[i]), "meta": metas[i] })
+    out
+
+  stats() <string, int>
+    out: <string, int> = {}
+    for name, held in cols
+      out[name] = held.count()
+    out

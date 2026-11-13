@@ -1,0 +1,53 @@
+use os
+use pathlib{ Path }
+
+// The port and the address the graph answers at.
+GRAPH_PORT = (os.environ.get("NUCLEAR_GRAPH_PORT") ?? "7878").toInt() ?? 7878
+GRAPH_URL = os.environ.get("NUCLEAR_GRAPH_URL") ?? "http://127.0.0.1:${GRAPH_PORT}"
+
+// The version of the Smart Graph (the same as `pyproject.toml` and `nuclear.toml`).
+GRAPH_VERSION = "0.2.0"
+
+graphPort() int = GRAPH_PORT
+graphUrl() string = GRAPH_URL
+graphVersion() string = GRAPH_VERSION
+
+// Where the graph keeps its data: one folder only its owner can open (0700).
+Paths
+  static home() Path
+    base: string = os.environ.get("NUCLEAR_GRAPH_HOME") ?? ""
+    data: string = os.environ.get("XDG_DATA_HOME") ?? ""
+    root = base.length > 0 ? Path(base) : (data.length > 0 ? Path(data) : Path.home().joinpath(".local", "share")).joinpath("nuclear-graph")
+    root.mkdir(parents = true, existOk = true)
+    // 0700
+    os.chmod(root, 448)
+    root
+
+  // What the AI set-up chose on this machine (ADR-0106): the `KEY=value` lines of nuclearlang/ai.env, written by
+  // `nuclear-loop setup` and the editor (the mode, the profile and its models).
+  static machine() <string, string>
+    config: string = os.environ.get("XDG_CONFIG_HOME") ?? ""
+    base = os.name == "nt" ? Path(os.environ.get("APPDATA") ?? "${Path.home()}") : (config.length > 0 ? Path(config) : Path.home().joinpath(".config"))
+    found: <string, string> = {}
+    try
+      text: string = base.joinpath("nuclearlang", "ai.env").readText()
+      for line in text.split("\n")
+        cut = line.indexOf("=")
+        if cut > 0 and not line.startsWith("#")
+          found[line.substring(0, cut)] = line.substring(cut + 1).trim()
+    catch e
+      return found
+    found
+
+  // The vectors of the shelves (Chroma).
+  static db() Path
+    Paths.home().joinpath("db")
+
+  static grants() Path
+    Paths.home().joinpath("grants.json")
+
+  // The prompt files: next to the package when it is installed, else the checkout's `prompts/` folder.
+  static prompts() Path
+    here = Path(__file__).resolve().parent
+    packaged = here.joinpath("prompts")
+    packaged.isDir() ? packaged : here.parent.parent.joinpath("prompts")

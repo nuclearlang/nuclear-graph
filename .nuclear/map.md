@@ -1,0 +1,496 @@
+# Project map: nuclear_graph (no platform)
+
+Written by `nuclear check` and `nuclear build`: every declaration with its kind, its description (its doc comment) and its members, in Nuclear. Read it before writing; a declaration without a description gets one with a `//` line above it.
+
+## The app
+
+- `access.nuc`
+  - `scopeNames() string[]` — (no description)
+  - `Client(name: string, scopes: string[])` — A client the graph knows, by its token: its name and what it may do.
+  - `Access(file: Path?)` — Who may use the graph. A program asks for access (`POST /v1/access`); nothing is given until the user allows it (`nuclear-graph allow <request>` or the editor). Each allowed client has its own token, stored only as a hash, and scopes: `read` (search, prompts, examples), `write` (remember, add examples), `admin` (ingest, manage).
+    - `grants: Path`
+    - `hashOf(token: string) string`
+    - `now() int` — Now, in seconds since the epoch.
+    - `load() <string, any>`
+    - `save(data: <string, any>) void`
+    - `grant(client: string, scopes: string[]) string` — Gives `client` a new token with `scopes` (its old token stops working). The token is shown once.
+    - `revoke(client: string) boolean`
+    - `clients() <string, any>`
+    - `who(token: string, owner: string) Client?` — The client and scopes of a token; the owner's token has every scope.
+    - `ask(client: string, scopes: string[], reason: string) string`
+    - `requests() <string, any>`
+    - `decide(rid: string, allow: boolean) void`
+    - `collect(rid: string) <string, any>` — The state of a request; an allowed one hands its token once, then forgets it.
+- `assets.nuc`
+  - `linesOf(text: string) string[]` — The lines of a text, without the line ends (none for an empty text).
+  - `asText(items: <string, any>[]) string` — Search results as one text for a prompt: each card, then the rows it links to in a line each.
+  - `Loaded(row: <string, any>, origin: string)` — A row of an asset file with where it comes from (`generated` or `curated`).
+  - `Assets` — The rows of the knowledge base (ADR-0104): how an asset file is read, what makes a row valid, what of a row is embedded and what is stored. An asset file is `assets/<shelf>/<name>.json`: `{shelf, origin, about, rows}`; a file `<name>.overlay.json` holds hand-written fields that the build merges into the generated rows of `<name>.json`.
+    - `textOf(value: any) string` — A body is a text or a list of lines (lines read and diff better inside JSON).
+    - `listOf(value: any) any[]`
+    - `mapOf(value: any) <string, any>`
+    - `normal(row: <string, any>) <string, any>` — The row with every field present.
+    - `fenceOf(line: string) string` — The language of the fence a line opens.
+    - `nuclearOnly(text: string) string` — The text without the code blocks of a target language (```python, ```dart, ```typescript...) and without what a dialect writes underneath a word (the `**Underneath (dialect):**` note): what a local agent reads.
+    - `foreignFences(text: string) string[]` — The languages of the fences a local agent must not read.
+    - `rowHash(row: <string, any>) string`
+    - `texts(value: any) boolean`
+    - `problems(byShelf: <string, <string, any>[]>) string[]` — Everything that makes the base invalid: a row is fixed, never ingested half right.
+    - `envelope(row: <string, any>, shelf: string) string` — What is stored (encrypted) for a row: the card a search answers.
+    - `cardOf(document: string) <string, any>?` — The card of a stored document; null for a plain text (what an agent kept at run time).
+    - `render(card: <string, any>) string` — A card as the text a model reads.
+    - `metadata(row: <string, any>, shelf: string, origin: string, rev: int) <string, any>` — The metadata of a row in Chroma: names, keys and filters, never the text. A list is never stored empty.
+    - `facets(row: <string, any>, shelf: string, origin: string, rev: int) <string, any>[]` — What a row becomes in its collection: the card (found by its title, summary and the start of its body) and one entry per question it answers. Each is {id, title, embed, document, meta}.
+    - `readFile(path: Path) <string, any>`
+    - `load(folder: Path) <string, Loaded[]>` — Every row of `<folder>/assets` by shelf, each with its origin (`generated` or `curated`).
+    - `blank(value: any) boolean`
+    - `lined(row: <string, any>) <string, any>` — The row as it is written: a body of several lines as a list of lines, and no empty field.
+    - `writeFile(path: Path, shelf: string, origin: string, about: string, rows: <string, any>[], generator: string) boolean` — Writes an asset file with its rows sorted by id; false when it already says the same.
+- `cli.nuc`
+  - `treeRoot() string` — The NuclearLang working tree: `NUCLEAR_ROOT`, else the one this checkout is a folder of.
+  - `graphPart(name: string) any` — A module of this package loaded when a command needs it: the client's commands (search, connect...) run without what the server and the MCP server need installed.
+  - `graphCall(method: string, path: string, body: <string, any>?, timeout: double, missing: boolean) <string, any>` — A call to the running graph with the owner's token. `missing`: whether a graph that is not running ends the command (else {} is answered).
+  - `askQuestions(out: Path, only: string[]) int` — Asks the running graph every question of `<out>/questions.toml` (or the ones that contain a word of `only`) and prints which found its row among the first results. 1 when one did not.
+  - `checkExamples(out: Path) int` — Compiles every ```nuclear block of the hand-written rows of the base, each alone, for its row's first platform (backend when it names none), and prints the errors. 1 when a block has one.
+  - `graphParser() any` — The command line of the graph: every command and its options.
+  - `graphHelp() string` — The help of this package's own command line (never of another copy on the PATH).
+  - `knowledgeContext(tree: Path, out: Path) Context` — What the knowledge base reads of this machine: the MCP server's tools and the HTTP routes, each from its module.
+  - `knowledgeCommand(args: any) void` — (no description)
+  - `connectCommand(client: string, scopes: string, show: boolean) void` — (no description)
+  - `main(argv: string[]?) void` — `nuclear-graph`: run, fill and guard the Nuclear Smart Graph.
+- `client.nuc`
+  - `tokenOf(client: string) string` — The token of a client of the graph: `NUCLEAR_GRAPH_TOKEN`, else the one `nuclear-graph connect <client>` stored (in the keyring, or in a file of the data folder only the owner reads).
+  - `GraphClient(client: string, url: string)` — The client of the graph for other programs (the local agents, the MCP server): it reads and writes the Nuclear Smart Graph. Answers are plain text, shaped to be put in a prompt.
+    - `call(method: string, path: string, body: <string, any>?) any`
+    - `items(query: string, shelves: string, k: int, platform: string, kind: string, type: string, agents: boolean, expand: boolean, kinds: string) <string, any>[]` — The cards that answer a query. `shelves`: one shelf or several separated by commas ("" = every shelf of the knowledge base). `kind` and `type` filter by those fields of a row; `kinds` keeps the rows that apply to a kind (the pitfalls of `usecase`).
+    - `search(query: string, shelves: string, k: int, platform: string, kind: string, type: string, agents: boolean, expand: boolean, kinds: string) string` — The closest pieces of knowledge, as one text for a prompt. A local agent searches with `agents = true` and its `platform`: Nuclear and Dragonfly only, nothing of a target language.
+    - `examples(task: string, platform: string, k: int, kind: string, type: string) string` — Validated Nuclear closest to `task`: files of the example projects (`type = "file"`), solved tasks (`type = "solved"`) or both; `kind` keeps one kind (usecase, repository...).
+    - `pitfalls(task: string, kind: string, platform: string, full: int) string` — The mistakes small models repeat with a kind, all of them: the `full` closest to the task as whole cards (the right shape to copy), the others in one line each (the rule).
+    - `card(id: string, related: boolean) string` — One row of the knowledge base by its id (`error:N0114`, `kind:backend.usecase`), with a line for each row it links to (`related`); "" when there is no such row.
+    - `brief(id: string) string` — A row in one line: `title — summary (`id`)`; "" when there is no such row.
+    - `applies(text: string, platform: string) string[]` — What of a spec or a task the platform cannot do yet, limits, or was never run for real (the capabilities rows whose trigger words the text writes), one line each: `title — summary (`id`, because it says "word")`.
+    - `strategy(text: string, platform: string, existing: string[]?, new: string[]?, runnable: boolean, only: string) <string, string>` — The strategy of a request (which kind of request it is, and the plan of that kind), each field a text: `id`, `title`, `summary`, `why` (the signs that chose it), `plan` (the card), `mode` (write, repair, verify, review, answer, commands, lead), `stages` (the Loop's stages it runs) and `generators`, separated by commas, `pieces` (where its pieces come from: plan, declaring, naming, none), `lead` (local or frontier), `needs` (the facts it cannot start without, one `name=question` per line) and `second` (the next closest). `existing` and `new`: the declarations the request names that the project has, and the ones it has not. `runnable`: for a run of the Loop. `only`: the strategy the request itself names. {} when the graph has no strategy.
+    - `answer(question: string, platform: string, history: string, agents: boolean, k: int) <string, string>` — What the graph gives for a question before a model answers it (its query planner; no model is asked), each a text for a prompt: `facts` (the exact answer of every question with one right answer the question is: the rows of the graph's database, whole), `knowledge` (the cards the shelves answer by meaning) and `needs` (the exact questions it is close to that lack a name). `history`: the conversation so far (`you: ...` / `agent: ...` lines), read for the names a follow-up leaves out.
+    - `kinds(platform: string) <string, string>` — Every way a kind of the platform is written, in lower case, and the kind it means: `use case` → `usecase`, `application component` → `appcomponent`, `usecase` → `usecase`.
+    - `prompt(useCase: string) string` — The validated prompt of a use case (feature, refactor, bug, docs, diagram, test, security, piece).
+    - `remember(id: string, text: string, collection: string, project: string, kind: string, platform: string) string` — Keeps a piece of knowledge about a project (`memory`) or a solved example (`examples`) for later.
+    - `stats() <string, any>`
+- `crypto.nuc`
+  - `Box(key: Bytes)` — Documents are stored encrypted (AES-256-GCM); only the graph's process, which holds the key, reads them.
+    - `aes: any`
+    - `seal(text: string) string`
+    - `open(sealed: string) string`
+- `extract.nuc`
+  - `sectionSize() int` — (no description)
+  - `runCommand(cmd: string[]) string?` — What a command prints; null when the tool is not installed.
+  - `Context(tree: Path, mcp: () => <string, any>, help: () => string, routes: () => <string, any>[], website: Path?, sections: <string, any>?, run: (cmd: string[]) => string?)` — What the extraction reads: the working tree, the website, `sections.toml`, and the four things it asks of this machine, which whoever starts it gives (the command line gives the real ones, a test its own): a command's output, the MCP server's instructions and tools ({instructions, tools: [{name, description, schema}]}), the help of this package's command line, and the routes of its HTTP API ([{verb, path, scope, doc}]).
+    - `problems: string[]`
+    - `read(rel: string) string`
+    - `section(name: string) any` — A table of `sections.toml` ({} when it has none).
+  - `walk(root: Path) Path[]` — Every file under `root`, in order, without entering generated, vendored or hidden folders.
+  - `stripChars(text: string, chars: string) string` — A text without the given characters at its two ends (`chars`: as inside a regular expression's `[...]`).
+  - `squeeze(text: string) string` — A text with every run of white space as one space.
+  - `before(text: string, mark: string) string` — What comes before the first `mark` of a text (the whole text when it has none), and what comes after it ("").
+  - `after(text: string, mark: string) string` — (no description)
+  - `slug(text: string, size: int) string` — (no description)
+  - `plain(text: string) string` — Markdown as plain words: no emphasis marks, a link as its text.
+  - `clip(text: string, size: int) string` — (no description)
+  - `firstSentence(text: string, size: int) string` — The first sentence of a text (or its first paragraph when it has no full stop).
+  - `cells(line: string) string[]` — The cells of a markdown table row (a pipe after a backslash is a pipe inside a cell).
+  - `rustText(text: string) string` — (no description)
+  - `captured(pattern: string, text: string, multiline: boolean) string` — The first group of a pattern in a text ("" when it is not there).
+  - `tableAt(value: any, key: string) <string, any>` — The table under a key of a map ({} when it has none), its list ([]) and its text ("").
+  - `listAt(value: any, key: string) any[]` — (no description)
+  - `textAt(value: any, key: string) string` — (no description)
+  - `ticked(names: string[]) string` — Names as code, separated by commas: `a`, `b`.
+- `extract_docs.nuc`
+  - `Document(rel: string, repo: string, path: Path)` — A document of the tree: the path the sections name, its repository and its file.
+  - `Piece(heading: string, body: string, name: string)` — A piece of a document: the headings it is under, its text and its name in the row's id.
+  - `ExtractDocs` — The rows of every markdown file of the tree, section by section, on the shelf its section names.
+    - `split(text: string) string[]` — Pieces of at most the size of a section, cut at blank lines.
+    - `markdown(text: string) string[][]` — The sections of a markdown file (by `#`/`##`/`###` headings) as [heading path, text] pairs, each cut to size.
+    - `kindOf(rel: string) string`
+    - `dialectOf(rel: string) string`
+    - `platformOf(rel: string, dialect: string) string`
+    - `documents(tree: Path, website: Path?) Document[]` — Every markdown (and grammar) file of the tree and the website.
+    - `matches(rel: string, globs: any[]) boolean`
+    - `docs(ctx: Context) <string, any[]>` — `<shelf>/<section>` → [what it holds, the rows of every document of that section, one per heading section].
+  - `generateAssets(ctx: Context) <string, any[]>` — Every generated asset file: `<shelf>/<name>` → [what it holds, its rows].
+- `extract_examples.nuc`
+  - `ExtractExamples` — The rows of the examples shelf: the example projects and the solved tasks.
+    - `declared(code: string) any[]` — The first declaration of a file: [its kind word ("" when it has none), its name, where it starts]; [] for none.
+    - `layoutKinds(layout: <string, any>, rel: string) string[]` — The kinds whose place in the platform's layout a file is at.
+    - `docComment(text: string, at: int) string` — The `//` lines right above the declaration at `at` (its decorators are skipped).
+    - `projects(ctx: Context) <string, any>[]`
+    - `solvedRow(rid: string, task: string, path: string, kind: string, code: string, plat: string) <string, any>`
+    - `solved(ctx: Context) <string, any>[]` — The answers of a frontier model to the evaluation's `train` tasks that pass the compiler and their acceptance texts (the distillation). The `test` tasks are held out: their answers never reach the graph.
+- `extract_language.nuc`
+  - `ExtractErrors` — The rows of the errors shelf that have a source: the compiler's diagnostics and the habits it corrects.
+    - `documented(spec: string) <string, <string, string>>` — spec/diagnostics.md: code → {stage, what, example, fix}.
+    - `diagnostics(ctx: Context) <string, any>[]`
+    - `sentence(note: string, text: string) string` — A note of the table as a sentence of its own.
+    - `habits(ctx: Context) <string, any>[]` — The table "Rules that change" of the base brief: what someone who knows another language writes by reflex.
+  - `Member(name: string, property: boolean, gives: string)` — One member of a base type: its name, whether it is a property, and what it gives.
+  - `Wrong(name: string, fix: string)` — A name of another language and the Nuclear one.
+  - `ExtractLibrary` — The rows of the language shelf that have a source: the standard library, read from the compiler's own table.
+    - `block(src: string, name: string) string`
+    - `put(found: <string, Wrong[]>, base: string, wrong: Wrong) void`
+    - `library(ctx: Context) <string, any>[]`
+- `extract_platforms.nuc`
+  - `platformOfDialect(dialect: string) string` — The platform a dialect builds ("" for a language dialect).
+  - `PlatformFiles(contract: <string, any>, docs: <string, any>, dialect: <string, any>, base: string)` — The files that say what a platform is: its contract, and the words and the manifest of its default dialect.
+  - `ExtractPlatforms` — The rows of the platforms shelf that have a source: the contract of each platform and the words of its default dialect; and what its generators write.
+    - `filesOf(ctx: Context, p: string) PlatformFiles`
+    - `platform(ctx: Context, p: string) <string, any>[]`
+    - `written(info: <string, any>, key: string) string` — A field as the contract writes it (`None` when it is not there: what the rows always said).
+    - `generators(ctx: Context) <string, any>[]` — What `dragonfly gen` writes on each platform, from the platform's own templates.
+- `extract_tools.nuc`
+  - `Entry(heading: string, lines: string[])` — An entry of a help text: the heading it is under and its lines.
+  - `ExtractTools` — The rows of the tools shelf that have a source: the command line tools as their help prints them, the MCP server, the HTTP routes, the Loop's stages, the local agents, the editor's commands and each component's version.
+    - `entries(text: string, indent: int) Entry[]` — A help text as entries: a line at `indent` starts one, the more indented lines below belong to it.
+    - `word(line: string) string` — The first word of a line.
+    - `describe(lines: string[]) string` — The description of a help entry: what follows the command after two spaces (or its `(alias)`), and its continuation lines.
+    - `entryOf(lines: string[], command: string) <string, any>` — A help entry as data: `what` it runs or makes (the first word after the command; `kind` for any kind of a platform), its whole command line (`usage`), its alias, the note before it ("backend and web projects") and what it does. `command`: what the help leaves out before its lines (`dragonfly make`).
+    - `toolRow(tool: string, name: string, found: string[][], sources: string[], extra: string) <string, any>` — One command's row from its help entries (each entry is its lines).
+    - `push(found: <string, string[][]>, key: string, lines: string[]) void`
+    - `cli(ctx: Context) <string, any>[]`
+    - `mcp(ctx: Context) <string, any>[]`
+    - `runs(source: string, tool: string) string` — The command line a tool of the MCP server runs, read from its own source ("" when it runs none): `dragonfly gen resource` for `generate_resource`, `nuclear check` for `nuclear_check`.
+    - `http(ctx: Context) <string, any>[]`
+    - `stages(ctx: Context) <string, any>[]`
+    - `agents(ctx: Context) <string, any>[]` — The local agents of the Nuclear Developer, from their own sources: the comment above each one says what it does.
+    - `editor(ctx: Context) <string, any>[]`
+    - `components(ctx: Context) <string, any>[]`
+- `facts.nuc`
+  - `factText(value: any) string` — A value as the tables keep it: a text as it is, true and false as words, a number as it is written.
+  - `Facts` — The exact facts of the knowledge base, in a relational database (SQLite): what a question with one right answer reads (every command of a tool, the parameters of an MCP tool, the commands that write a kind). The database lives in the memory of the graph's process only, never on disk: it is made from the rows of the base (at the start, from the cards the store keeps sealed; again at every ingest) and read with the queries of the base's own catalogue (the `queries` shelf). It holds names, one-line summaries and structured fields: never a row's body, never what an agent kept at run time.
+    - `tables: any` — The database, once it was filled; one reader at a time.
+    - `turn: any`
+    - `filled() boolean` — Whether the tables were ever filled.
+    - `flatten(card: string, prefix: string, value: any, fields: any[], items: any[]) void` — Every value of a row's `meta` or `data` as the rows of `fields` and `items`.
+    - `fill(byShelf: <string, Loaded[]>, revision: int) <string, int>` — Makes the tables hold exactly the rows of the base (`byShelf`: shelf → its rows with where each comes from), at its revision. They are made aside and then take the place of the old ones: a reader sees the old facts or the new ones, never half.
+    - `run(sql: string, params: <string, any>?) <string, any>[]` — The rows a query gives, each as column → value. `params`: its named parameters (`:kind`), never text put inside the query; a parameter the query does not name is left out. The database is only read.
+    - `pairs(sql: string) string[][]` — The first two columns of every row a query gives, as texts: what people write and the value it means (the `values` of a query's parameter).
+    - `problems(rows: <string, any>[]) string[]` — What is wrong with the catalogue of exact questions (the rows of the `queries` shelf): a query that the tables cannot run, a parameter it names and does not declare, a declared one it never uses. Checked against empty tables: the build fails before a broken query reaches the graph.
+- `ingest.nuc`
+  - `Ingest` — Fills the shelves of the graph from the knowledge base folder (`nuclear-graph knowledge build` wrote it; ADR-0104), its table of exact facts, and the `prompts` collection from this package's prompt files. Only what changed is embedded again; a row the base no longer has is removed, and what an agent wrote at run time (`origin: runtime`) is kept.
+    - `prompts() <string, any>[]` — The validated prompt of each use case (`prompts/<use_case>.md`) and of each agent step (`agents/<step>.md`: `agent.<step>`).
+    - `stored(store: Store) <string, Loaded[]>` — The rows of the base as the store holds them (each shelf's cards, read back from their sealed documents and their metadata): what the exact facts are made from when the graph starts. What an agent kept at run time is not a card, and is left out.
+    - `sync(store: Store, collection: string, items: <string, any>[], keep: string[], log: (line: string) => void) <string, int>` — Makes a collection hold exactly `items` (and the ids of `keep`), embedding only the ones whose hash changed.
+    - `ingest(store: Store, folder: Path, log: (line: string) => void, facts: Facts?) <string, any>` — The knowledge base folder `root` becomes what the graph knows: its shelves, and with `facts` its exact facts, made again whole. An invalid base is refused whole: the graph never holds half of a revision.
+- `knowledge.nuc`
+  - `Knowledge` — The knowledge base as a folder (the `nuclear-knowledge` repository, `nuclear-developer/data`; ADR-0104): the asset files the Smart Graph ingests, their schema and their version.  - `assets/<shelf>/<name>.json` with `"origin": "generated"`: written here from the working tree (the `Extract*` modules); never edited by hand. `<name>.overlay.json` beside one adds hand-written fields to its rows (links, examples, questions). - `assets/<shelf>/<name>.json` with `"origin": "curated"`: written by hand (the purpose, the concepts, the playbooks, the capabilities, the failures). Each row names the `sources` it was written from. - `manifest.json`: the schema, the revision and every row with its hash and the revision that last changed it; for a curated row, the hash of each of its sources when it was last reviewed.  `build` writes what is generated, validates everything and raises the revision when a row changed. `check` fails when the assets are not what the tree generates now, when a row is invalid, or when a source of a curated row changed since its review: the base is never left behind the code.
+    - `context(tree: Path, out: Path, mcp: () => <string, any>, help: () => string, routes: () => <string, any>[]) Context` — What the extraction reads for the base `out` of the tree `tree`: its `sections.toml`, the website it names, and what the caller gives of this machine (the MCP server's tools, the command line's help, the HTTP routes).
+    - `overlaid(name: string, rows: <string, any>[], out: Path, problems: string[]) <string, any>[]` — The generated rows with the hand-written fields of `<name>.overlay.json` merged in by id.
+    - `generated(out: Path, ctx: Context, problems: string[]) <string, any[]>` — Every generated file as the tree gives it now (overlays merged), and what the extraction found wrong: the files are `<shelf>/<name>` → [what it holds, its rows]; the problems are added to `problems`.
+    - `filesOf(out: Path, origin: string) <string, <string, any>>` — The asset files of one origin as they are written now: `<shelf>/<name>` → the file.
+    - `sourceHash(ctx: Context, source: string) string` — The hash of a source of a curated row: a file, or one heading's section of it (`file#Heading`).
+    - `rowsOf(files: <string, any>) <string, <string, any>[]>` — shelf → rows, from `<shelf>/<name>` → [about, rows] (a generated file) or a file's data (one written by hand).
+    - `readManifest(out: Path) <string, any>`
+    - `block(items: <string, any>) string[]`
+    - `writeManifest(out: Path, manifest: <string, any>) void` — One row per line: a diff of the manifest shows the rows that changed.
+    - `indexMd(byShelf: <string, <string, any>[]>, revision: int) string`
+    - `hashesOf(byShelf: <string, <string, any>[]>) <string, any[]>` — The short hash of every row: id → [shelf, hash].
+    - `build(out: Path, ctx: Context, today: string) <string, any>` — Writes the generated assets, validates the whole base and raises the revision when a row changed. With a problem nothing is versioned: fix it and build again.
+    - `stale(ctx: Context, manifest: <string, any>) string[]` — The curated rows whose source changed since their last review.
+    - `check(out: Path, ctx: Context) string[]` — Every way the base is behind the tree: a generated file that is not what the tree gives now, an invalid row, a manifest of other rows, a curated row whose source changed.
+    - `review(out: Path, ids: string[], ctx: Context) string[]` — Records that the curated rows `ids` (every stale one when empty) still hold with their sources as they are.
+- `mcp_server.nuc`
+  - `remoteOnly() boolean` — Whether this machine was set up for remote agents only (`NUCLEAR_AI_MODE`, else the machine's `ai.env`).
+  - `projectOf(folder: string) Path?` — The closest folder up with a config.nuc (a Dragonfly project).
+  - `taskSlug(text: string) string` — (no description)
+  - `specMarkdown(title: string, description: string, criteria: string[], useCase: string) string` — The spec file the Loop reads (the shape of `specMarkdown` in the Loop engine), led by the local agents.
+  - `shapeKind(value: any) string` — What a JSON value is, in Nuclear's words.
+  - `shape(value: any, depth: int) string` — The shape of a JSON value, one key per line: `name: string`, a nested object indented, a list by its first item.
+  - `McpTools(graph: GraphClient, tools: Toolchain, web: Web)` — The tools of the MCP server of NuclearLang (stdio): the Nuclear Smart Graph, the `nuclear` and `dragonfly` command line tools and the local developer agents, for any MCP client (Claude Code, Codex, Cursor...). The graph is reached with the token of the client `mcp` (`nuclear-graph connect mcp`), so the user decides whether MCP clients may read it. Each method with a comment is a tool, and the comment is what the client reads of it.
+    - `graphSearch(query: string, shelf: string, k: int, platform: string, kind: string, type: string) string` — Search the Nuclear Smart Graph, by meaning and by exact name (a diagnostic code, a command, a kind). shelf: concepts (what it is, why, how it works), language (how it is written in Nuclear), platforms (kinds, decorators, layout, plugins), tools (CLI commands, MCP tools, HTTP routes, generators, agents), errors (diagnostics, failures and their fixes), capabilities (what can and cannot be done, limits), playbooks (procedures, roles, skills), examples (validated Nuclear), docs (the long documents: dialects, ADRs, context, status), memory (what agents kept about projects); several separated by commas; "" searches every shelf. platform: backend, mobile, web. kind: a kind's rows (usecase, repository...). type: a row type (diagnostic, kind, cli, playbook...). Each card comes with the rows it links to.
+    - `graphAnswer(question: string, platform: string) string` — The exact answer to a question that has one (every command of a tool, the tools of this server and their parameters, the commands that write a kind, a diagnostic by its code, the stages of the Loop, the members of a base type, a version...): the rows of the graph's database, whole, never recalled; then the cards the shelves answer by meaning. Prefer it to graph_search for "which", "list", "what are the" questions. platform: backend, mobile or web.
+    - `graphStrategy(request: string, platform: string) string` — Which kind of request this is (a whole system, a component, a resource, one screen, a use case, a rename, a failing test, a question...) and the plan of that kind, step by step with the tool of each step. Call it first, with the user's request in their own words, and follow the plan it answers. platform: backend, mobile or web.
+    - `graphCard(id: string) string` — One row of the graph by its id, with what it links to: error:N0114 (a diagnostic), kind:backend.usecase, decorator:backend.get, tool:dragonfly.gen.resource, mcp:generate_resource, lib:string, platform:mobile, layout:web, playbook:<name>, concept:<name>.
+    - `graphPrompt(useCase: string) string` — The validated prompt of a use case: feature, refactor, bug, docs, diagram, test, security, piece, plan.
+    - `graphRemember(id: string, text: string, collection: string, project: string) string` — Keep a decision, a name or a solved example (collection examples: the task, then the validated .nuc) so the local developer and later sessions find it.
+    - `nuclearCheck(code: string, path: string, dialect: string) string` — Errors of a piece of Nuclear (code) or of a whole project (path of its folder): `ok` or one line per error with its fix.
+    - `nuclearBuild(code: string, dialect: string) string` — What a piece of Nuclear becomes in the dialect's language (Python, TypeScript, Dart).
+    - `nuclearHelp(word: string, dialect: string) string` — Documentation of a kind, decorator, header word (with dialect), a topic or a command.
+    - `nuclearBrief(dialect: string) string` — The short sheet of Nuclear and a platform (backend, mobile, web), or a dialect: read it before writing .nuc.
+    - `nuclearFmt(code: string) string` — The piece of Nuclear in the canonical layout.
+    - `nuclearDefs(name: string, dialect: string) string` — A declaration of the type definitions (a class or Class.member of a library the dialect uses).
+    - `dragonfly(project: string, command: string, args: string[]?) string` — A dragonfly command in a project folder: new, build, install, test, check, analyze, make (g), migrate, add, explain. Example: command="make", args=["component", "orders"].
+    - `projectInspect(project: string) string` — What a Dragonfly project has: its platform and dialect, its components with their declarations by kind, and the generators of its platform. Call it before generating or writing, so nothing is declared twice.
+    - `generateComponent(project: string, component: string) string` — A new component of the project with its facade (appcomponent).
+    - `generateResource(project: string, component: string, name: string, fromJson: string, fromSpec: string, fields: string, source: string, path: string, actions: string[]?, screen: string, plural: string, dryRun: boolean) string` — The finished, compiling code of a resource: its models, the repository, one use case per action, the facade's aliases, the controller (backend) or, with screen, a screen with its state manager (mobile, web), and the tests. The fields: from_json (an example answer of the API: a url, which also gives the API, or a file), from_spec (a spec.md: its example answer or its Key | Type table, and its `GET <url>` line), or fields ("id:int name:string origin:Origin?"). source: "rest:<base url>", "rest" or "db" (backend only). actions: of list, get, search, create, update, delete (default: list and get for an API, the rest for a database). dry_run shows the files without writing them. Nothing is overwritten; a name declared elsewhere stops it.
+    - `generateUsecase(project: string, component: string, name: string, calls: string, route: string, dryRun: boolean) string` — A use case wired into its component: its alias in the facade and, with route (backend), its route in the controller of the route's prefix ("POST orders/{id}/cancel": a {name} is a parameter of the use case; the controller is created when missing). With calls ("OrderRepository.pending": a method that repository declares) the use case is written too, because it only calls that method. Without calls the use case must already be in the project: one with rules of its own is written first (developer_task, or by hand), then this wires it. dry_run shows the files without writing them.
+    - `generateScreen(project: string, component: string, screen: string, route: string) string` — A screen of a mobile or web project with its state manager and state model, for a view that is not a list of a resource (generate_resource with screen writes those).
+    - `apiInspect(url: string, project: string, component: string, name: string) string` — Fetches a public API's url and answers the shape of its JSON (keys, types, nested objects, a paged answer). With project, component and name it also shows the files generate_resource would write from it.
+    - `webSearch(query: string, pages: int) string` — Searches the internet (e.g. an API's documentation: "rick and morty api character schema") and answers the first results with the text of their first pages.
+    - `webRead(url: string) string` — The text of a public page (an API's documentation), without its code blocks.
+    - `developer(path: string, body: <string, any>) string` — One file asked of the local developer over HTTP: its check, its attempts and its code.
+    - `developerTask(project: string, title: string, description: string, criteria: string[], useCase: string) string` — FIRST STEP of every task that writes .nuc: the local Nuclear Developer does the whole task in the project folder (plan, tests first, code, verification, security, artifacts) and documents it. Give the description and one acceptance criterion per item; use_case: feature, bug, refactor, test. Answers the run's journal (every step, the files written, what is left for you); then validate and correct, and call developer_review.
+    - `developerRetry(project: string, run: string, fromStage: string, fromStep: string, scratch: boolean) string` — A developer_task run again: from the step that failed (every step that passed is kept); the whole of from_stage (generate, plan, test, code, verify, security, artifacts, deploy), the stages before it kept; from one step (from_step: its id in the journal, `code-3`: that step and all after it, whether it passed or failed); or from scratch (scratch: every stage again, what the run wrote undone first). Read the journal's "Why it failed" first: retry when the failure was passing (a service down) or after you fixed its cause. Answers the journal again.
+    - `developerReview(project: string, run: string, notes: string, files: string[]?) string` — LAST STEP: record your review of a developer_task run: what you corrected and why (notes), and the project paths of the files you corrected. Appends it to the run's journal and keeps each corrected file, with its task, in the graph's examples so the local developer writes it right next time.
+    - `developerCode(task: string, platform: string, path: string, kind: string, context: string, project: string) string` — Ask the local developer (a 3B model with the graph) for ONE .nuc file, outside a developer_task run (a quick piece, a rewrite of one file). A short, complete order: the path, the kind, every name and signature it must use and the platform (backend, mobile, web; it writes only Nuclear). With project (the project's folder) it reads by itself the files that declare the names the task writes; otherwise paste them in context. It checks its answer with the compiler, repairs it, holds it to the task's own words and returns it; it does not write the file.
+    - `developerTest(task: string, code: string, platform: string) string` — Ask the local tester for the Nuclear tests (`tests` kind) of a piece of code.
+    - `developerSecurity(code: string, platform: string) string` — Ask the local security reviewer for the findings of a piece of code.
+    - `all() any[]` — Every tool, in the order a client lists them.
+  - `mcpServer() MCPServer` — The MCP server with its tools. A machine set up for remote agents only gets neither the graph's nor the local developer's.
+  - `mcpTools() <string, any>` — The instructions and the tools of the MCP server, as data for the knowledge base: {instructions, tools: [{name, description, schema}]}.
+  - `mcpMain() void` — Serves MCP over stdio until the client closes it.
+- `paths.nuc`
+  - `graphPort() int` — (no description)
+  - `graphUrl() string` — (no description)
+  - `graphVersion() string` — (no description)
+  - `Paths` — Where the graph keeps its data: one folder only its owner can open (0700).
+    - `home() Path`
+    - `machine() <string, string>` — What the AI set-up chose on this machine (ADR-0106): the `KEY=value` lines of nuclearlang/ai.env, written by `nuclear-loop setup` and the editor (the mode, the profile and its models).
+    - `db() Path` — The vectors of the shelves (Chroma).
+    - `grants() Path`
+    - `prompts() Path` — The prompt files: next to the package when it is installed, else the checkout's `prompts/` folder.
+- `planner.nuc`
+  - `Planner` — The plan of an answer (the query planner of the Smart Graph): what a question needs from the graph before any model reads it. A question with one right answer (every command of a tool, the parameters of an MCP tool, the commands that write a kind) is not searched by meaning: it is matched to its row of the catalogue of exact questions (by meaning and by the names it writes), the names it writes fill the query's parameters, and the query runs over the exact facts (SQLite). What is left (what something is, why, how it is done) is searched in the shelves as always, and the shelves decide which of the two a question is: a query runs only when its exact question is closer to the question than the closest card. A model then writes the answer from both: it copies the facts, it never recalls them.
+    - `said(facts: Facts, param: <string, any>) string[][]` — The values a parameter takes from words: each [what people write, the value it means], longest first.
+    - `named(pairs: string[][], grams: string[]) string[]` — The values of a parameter that some words name (`grams`: every run of words of a text, in lower case), in the order the words come.
+    - `runs(text: string) string[]` — Every run of 1 to 4 words of a text, in lower case: the names it may be writing (`use case`, `gen resource`).
+    - `earlier(history: string) string[]` — The user's own earlier messages of a conversation (`you: ...` lines), newest first.
+    - `shown(columns: string[], rows: <string, any>[]) string` — The rows of a query as lines a model copies: the columns once, then a line per row.
+    - `choose(store: Store, facts: Facts, asked: string, grams: string[], past: string[], platform: string, scored: <string, any>[], needs: string[]) void` — The exact questions of the catalogue a text is close to, each with its parameters filled from the names the question writes (`grams`), the project's platform and the messages before it (`past`): the ones that can run are added to `scored`, the ones that lack a name to `needs`.
+    - `answer(store: Store, facts: Facts, question: string, platform: string, history: string, agents: boolean, k: int) <string, any>` — The plan of an answer to `question`: {exact, needs, cards, text}. `exact`: the queries that were run, each {id, title, why, params, columns, rows}; `needs`: the exact questions that were close but lack a name ("which kind?"); `cards`: what the shelves answer by meaning; `text`: all of it as the text a prompt gets. `platform`: the project's; `history`: the conversation so far (`you: ...` / `agent: ...` lines), read for the names a follow-up leaves out; `agents`: only what a local agent may read.
+- `retrieve.nuc`
+  - `stopWords() string[]` — The words that name nothing (English and Spanish: people ask in both).
+  - `Retrieve` — How the graph is searched (ADR-0104): by meaning and by exact name at once, over several shelves.  1. The query is embedded once and each shelf answers its closest rows (a row is found by its own text or by one of the questions it answers). 2. The exact names the query writes (`N0114`, `dragonfly gen`, `usecase`, `mcp`) are looked up in the rows' `keys`: a row that carries one is brought in and moves up, more for a longer name. 3. The rows are ranked together, each card once; a search may follow the links of the best ones.
+    - `wordsOf(text: string) string[]` — The words of a text as a query writes names: lower case, without the punctuation around them.
+    - `candidates(query: string) string[]` — The exact names a query may be writing: every run of 1 to 5 of its words, in lower case.
+    - `scope(platform: string, agents: boolean, where: <string, any>?) <string, any>?` — The filter of a search: what a local agent may read, the rows of a platform (and of every platform), and the caller's own filter.
+    - `weight(key: string) double`
+    - `both(first: <string, any>?, second: <string, any>) <string, any>`
+    - `search(store: Store, query: string, among: string[], k: int, platform: string, agents: boolean, where: <string, any>?, expand: boolean) <string, any>[]` — The `k` cards that answer a query best: {id, shelf, text, meta, distance, score, via} and, for a card of the knowledge base, `card` (its fields) and with `expand` the rows it links to (`related`). `score` ranks them (the distance less what a name the query writes is worth); `distance` is by meaning alone.
+    - `applies(store: Store, text: string, platform: string) <string, any>[]` — The capabilities rows that apply to a text (a spec, a task) because it writes one of their `triggers`: what the platform cannot do yet, a limit, a part never run for real. Exact, never by meaning: {id, type, title, summary, trigger}.
+    - `strategy(store: Store, text: string, platform: string, existing: string[]?, fresh: string[]?, runnable: boolean, only: string) <string, any>[]` — The strategies that fit a request (a spec, a task, an order of the chat), best first: {id, title, summary, score, why, data, text}. A strategy row says how its kind of request is recognised: `data.signals` (regular expressions over the request), `meta.triggers` (its words), `data.target` (`existing`: the request names a declaration the project has; `new`: one it has not; the caller gives both lists) and, by meaning, its text and the questions it answers. `runnable`: the caller is a run of the Loop, which a strategy without stages (a question, a command, a limit) would stop: such a strategy comes first only when an exact sign chose it. `only`: the strategy the request itself names (`usecase` or `strategy:usecase`), which then comes first. Nothing here asks a model.
+    - `staged(card: <string, any>) boolean` — Whether a strategy's card names stages of the Loop.
+    - `fill(item: <string, any>, stored: <string, any>) void`
+    - `byId(store: Store, cardId: string, expand: boolean) <string, any>?` — One card by its id, with the rows it links to.
+    - `expand(store: Store, items: <string, any>[], limit: int) void` — Adds to each card the title and summary of the rows it links to (`limit` per search, the closest cards first).
+- `secrets_store.nuc`
+  - `Secrets` — The two secrets of the graph: the key that encrypts its documents and the owner's token. They live in the desktop keyring (libsecret's `secret-tool`); without one, in files of the data folder readable only by the owner. The names the keyring keeps are written down (`.keyring`, no secret in it): a keyring that does not answer for one of them is closed, and the secret is waited for, never made again (a second key would open no card, a second owner's token would be one the user's tools do not have).
+    - `env() <string, string>` — MCP clients start servers with a minimal environment: find the user's session bus (where the keyring is).
+    - `keyring() boolean`
+    - `keyringGet(name: string) string?`
+    - `keyringSet(name: string, value: string) boolean`
+    - `fileOf(name: string) Path`
+    - `write(file: Path, value: string) void` — A file only the owner reads (0600).
+    - `noted() string[]` — The names of the secrets the keyring keeps for this graph.
+    - `note(name: string) void`
+    - `secret(name: string, make: () => string, wait: int) string` — The secret `name`, made with `make()` the first time. One the keyring keeps while the keyring is closed is waited for (`wait` seconds), then refused: a graph started by the system starts again until the keyring opens.
+    - `closed(name: string) boolean` — Whether the keyring keeps `name` and does not answer for it now.
+    - `newKey() string`
+    - `key() Bytes` — The AES-256 key of the documents.
+    - `ownerToken() string` — The token of the graph's owner (the user's CLI and editor): every scope.
+    - `find(name: string) string?` — The secret `name` if it was kept, or null (never made here).
+    - `keep(name: string, value: string) void` — Keeps a secret given by the user (a search key) in the keyring, or in a file only the owner reads.
+- `server.nuc`
+  - `SearchIn` — `collection`: one collection, or "" for every shelf of the knowledge base; `shelves`: several shelves (instead of `collection`); `platform`: backend, mobile or web (the rows of that platform and the ones of every platform); `agents`: only what a local agent may read (Nuclear only); `where`: more filters by metadata ({"type": "kind"}, {"kind": "usecase"}, {"code": "N0114"}); `expand`: each card comes with the title and summary of the rows it links to.
+    - `query: string`
+    - `collection: string`
+    - `shelves: string[]?`
+    - `k: int`
+    - `platform: string`
+    - `agents: boolean`
+    - `where: <string, any>?`
+    - `expand: boolean`
+  - `AppliesIn` — (no description)
+    - `text: string`
+    - `platform: string`
+  - `StrategyIn` — `existing` and `new`: the declarations the request names that the project has, and the ones it has not (null: no project was read); `runnable`: the caller is a run of the Loop (a strategy without stages comes first only when an exact sign chose it); `only`: the strategy the request itself names, when it names one.
+    - `text: string`
+    - `platform: string`
+    - `existing: string[]?`
+    - `new: string[]?`
+    - `runnable: boolean`
+    - `only: string`
+  - `PutIn` — (no description)
+    - `collection: string`
+    - `id: string`
+    - `text: string`
+    - `meta: <string, any>`
+  - `AccessIn` — (no description)
+    - `client: string`
+    - `scopes: string[]`
+    - `reason: string`
+  - `IngestIn` — (no description)
+    - `roots: string[]`
+  - `AnswerIn` — `platform`: the project's (backend, mobile or web); `history`: the conversation so far, as `you: ...` and `agent: ...` lines, read for the names a follow-up leaves out; `agents`: only what a local agent may read; `k`: how many cards the shelves give.
+    - `question: string`
+    - `platform: string`
+    - `history: string`
+    - `agents: boolean`
+    - `k: int`
+  - `Route(verb: string, path: string, scope: string, handler: any)` — One route of the HTTP API: its verb, its path, the scope a token needs for it ("" when it needs none) and the method that answers it (its comment is the route's documentation).
+  - `Api(store: Store?, grants: Access?, ownerToken: string?, exact: Facts?)` — The graph's HTTP API, on 127.0.0.1 only. Every route but `/v1/health` and the access request needs a token; requests from a browser (with an `Origin` header) are refused, so a web page cannot reach it.
+    - `held: Store?`
+    - `access: Access`
+    - `owner: string`
+    - `known: Facts`
+    - `lock: any`
+    - `db() Store`
+    - `facts() Facts` — The exact facts: made from the cards the store holds the first time they are asked for (a graph that starts).
+    - `noBrowsers(request: Request, callNext: any) any` — A request with an `Origin` header comes from a browser: refused.
+    - `allowed(request: Request, scope: string) string` — The client of a request: its token is one the user allowed (401 otherwise) and has the scope (403 otherwise).
+    - `health() <string, string>` — Whether the graph is running, and its version. Needs no token.
+    - `search(body: SearchIn, request: Request) <string, any>` — Searches the graph by meaning and by exact name: `{query, collection | shelves, k, platform, agents, where, expand}` answers `{items: [{id, shelf, text, meta, distance, score, via, card, related}]}`. Without a collection it searches every shelf of the knowledge base.
+    - `card(cardId: string, request: Request) <string, any>` — One row of the knowledge base by its id (`error:N0114`, `kind:backend.usecase`, `tool:dragonfly.gen.resource`), with the title and summary of the rows it links to.
+    - `applies(body: AppliesIn, request: Request) <string, any>` — What of a spec or a task is not possible yet or was never run for real: the capabilities rows whose `triggers` the text writes, for its platform: `{text, platform}` answers `{items: [{id, type, title, summary, trigger}]}`. Exact, never by meaning.
+    - `strategy(body: StrategyIn, request: Request) <string, any>` — The strategy of a request: which kind of request it is (a whole system, one screen, a rename, a failing test...) and the plan of that kind. `{text, platform, existing, new}` answers `{items: [{id, title, summary, score, why, data, text}]}`, best first, at most three. By the request's exact signs first, then by meaning.
+    - `answer(body: AnswerIn, request: Request) <string, any>` — What a question needs from the graph before a model answers it: `{question, platform, history, agents, k}` answers `{exact, needs, cards, facts, knowledge}`. `exact`: the questions with one right answer it is (matched to the catalogue of exact questions by meaning and by the names it writes), each run over the exact facts (SQLite) with its rows whole; `needs`: the exact questions it is close to that lack a name; `cards`: what the shelves answer by meaning; `facts` and `knowledge`: both as the text a prompt gets. No model is asked.
+    - `kinds(platform: string, request: Request) <string, string>` — Every way a kind of a platform is written (its own word and how people say it: `use case`, `application component`) with the kind it means: what a planner needs to read a spec.
+    - `prompt(useCase: string, request: Request) <string, any>` — The prompt file of a use case (`feature`, `piece`, `test`...) or of an agent's step (`agent.repair`).
+    - `put(body: PutIn, request: Request) <string, any>` — Keeps what an agent learned at run time: a note about a project (`memory`) or a solved example (`examples`). The rows of the knowledge base are written only by ingest; these survive it.
+    - `delete(collection: string, docId: string, request: Request) <string, string>` — Removes what an agent kept at run time (`memory`, `examples`).
+    - `stats(request: Request) <string, any>` — The rows of each collection, and the schema and revision of the knowledge base the graph holds.
+    - `ingest(body: IngestIn, request: Request) <string, any>` — Makes the knowledge base folder `roots[0]` what the graph knows; only what changed is embedded again.
+    - `ask(body: AccessIn) <string, string>` — A program asks for access with the scopes it needs; nothing is given until the user allows the request.
+    - `collect(rid: string) <string, any>` — The state of an access request; once allowed, its token, a single time.
+    - `requests(request: Request) <string, any>` — The pending access requests and the allowed clients.
+    - `decide(rid: string, decision: string, request: Request) <string, string>` — Allows or denies an access request (`allow` or `deny`).
+    - `routes() Route[]` — Every route of the API, in the order the documentation lists them.
+  - `graphApp(store: Store?, access: Access?, owner: string?, facts: Facts?) FastAPI` — The graph's HTTP application: every route of `Api`, and no browser.
+  - `graphRoutes() <string, any>[]` — The routes of the HTTP API as data, for the knowledge base: [{verb, path, scope, doc}]. Nothing is opened.
+- `shelves.nuc`
+  - `Shelf(answers: string, holds: string, types: string[], prefixes: string[], meta: string[])` — `answers`: the question a reader brings to this shelf; `holds`: what its rows are; `types`: the `type` of a row; `prefixes`: an id is `<prefix>:<name>`, and a prefix lives in exactly one shelf; `meta`: the metadata of its own a search may filter by, besides the common ones.
+  - `shelfTable() <string, Shelf>` — A top-level value belongs to its file: the others read it through these.
+  - `schemaVersion() int` — (no description)
+  - `runtimeCollections() string[]` — (no description)
+  - `collections() string[]` — (no description)
+  - `legacyCollections() string[]` — (no description)
+  - `platformNames() string[]` — (no description)
+  - `exactShelf() string` — (no description)
+  - `searchedShelves() string[]` — The shelves a search of every shelf reads: all but the catalogue of exact questions.
+  - `shelfOf(rowId: string) string` — The shelf an id lives in, by its prefix ("" for an id no shelf holds).
+  - `graphSchema() <string, any>` — The schema as data (what `schema.json` holds).
+- `store.nuc`
+  - `asDocument(title: string, text: string) string` — EmbeddingGemma's prompt of a document: its title, then its text.
+  - `asQuery(text: string) string` — EmbeddingGemma's prompt of a search.
+  - `ollamaEmbed(shaped: string[]) double[][]` — The vectors of texts already shaped for the model (`asDocument`, `asQuery`), by the local embeddings model.
+  - `closest(got: any, vector: double[]) <string, any>[]` — What a read of a collection with its vectors becomes for a search: each item (id, metadata) with how far its vector is from `vector` by direction (cosine: 0 is the same one), the closest first.
+  - `textOr(first: any, second: any) string` — The first of two values that is a text with something in it.
+  - `storable(meta: <string, any>) <string, any>` — What Chroma keeps as metadata: texts, numbers, booleans and lists of texts that are not empty.
+  - `Store(path: string, key: Bytes?, embed: (shaped: string[]) => double[][]?)` — The graph's store: one Chroma collection per shelf (ADR-0104), whose documents are encrypted and whose vectors come from a local embeddings model (Ollama). Only the server process opens it.  A row's metadata is in clear (ids, names, keys, filters: what Chroma searches by); its text is sealed. The shelves of the knowledge base are made by `ingest`; `prompts` holds the prompt files of this package and `memory` what an agent decided to keep about a project while working on it.
+    - `client: any`
+    - `box: Box`
+    - `embedder: (shaped: string[]) => double[][]`
+    - `cols: <string, Collection>`
+    - `col(name: string) Collection`
+    - `put(collection: string, items: any[]) int` — Adds or replaces items. Each is {id, document, meta} (a list `[id, text, meta]` is the same); what is embedded is `embed` under `title` when given, else the document; with `query`, `embed` is embedded as a search is (a question a row answers). The document is stored encrypted.
+    - `delete(collection: string, ids: string[]) void`
+    - `dropLegacy() string[]` — Removes the collections of before the shelves (ADR-0104).
+    - `version() <string, int>` — The schema and the revision of the knowledge base this store holds (0: never ingested).
+    - `setVersion(schema: int, revision: int) void`
+    - `hashes(collection: string, where: <string, any>?) <string, string>` — id → content hash of the items of a collection (to embed again only what changed).
+    - `embedQuery(query: string) double[]`
+    - `near(collection: string, vector: double[], k: int, where: <string, any>?) <string, any>[]` — The `k` items closest to a vector among the ones a filter matches: id, metadata and distance (0 is the same meaning), without their text. Exact: the vector the store keeps of each of them is compared (a shelf holds hundreds of items: milliseconds). The store's own index is approximate and, once items were replaced, does not reach every item it holds: it is not asked.
+    - `measure(collection: string, vector: double[], ids: string[]) <string, any>[]` — How far each of these items is from a vector, as `near` gives them.
+    - `where(collection: string, where: <string, any>, limit: int?) <string, any>[]` — The items a filter matches: id and metadata.
+    - `documents(collection: string, ids: string[]) <string, <string, any>>` — id → {text, meta} of the items with these ids (the ones that exist).
+    - `read(collection: string, where: <string, any>) <string, any>[]` — The items a filter matches, with their text.
+    - `stats() <string, int>`
+- `toolchain.nuc`
+  - `Ran(code: int, out: string)` — What a command gave: its exit code and what it printed.
+  - `runTool(args: string[], cwd: string?, timeout: int) Ran` — Runs a command and waits for it, at most `timeout` seconds.
+  - `diagnosticsOf(out: string) <string, any>[]?` — Every JSON array `nuclear check --json` printed (one per file group), joined; null if there is none.
+  - `bracketFrom(text: string, start: int) int` — Where the next `[` of a text is, from `start` on (-1 when there is none).
+  - `describe(diagnostics: <string, any>[]) string` — `line:col CODE message (fix: ...)`, one per error; `ok` when there are none.
+  - `stripFences(code: string) string` — The code inside a model's ```nuclear block (or the text as it is).
+  - `snake(name: string) string` — `BooksOfAuthor` → `books_of_author`, `HTTPClient` → `http_client` (a file name).
+  - `layoutPath(layout: <string, string>, kind: string, name: string, component: string, screen: string) string` — The path of a declaration's file by the platform's layout; "" for a kind the layout does not know.
+  - `target(name: string) string[]` — `--platform backend` for a platform (what an agent that writes only Nuclear names), `--dialect fastapi` else.
+  - `Toolchain` — The NuclearLang command line tools, for agents: check, build and format a piece of Nuclear, and run the Dragonfly commands of a project. Answers are short texts a small model can read.
+    - `check(code: string, platform: string) string` — The errors of a piece of Nuclear (`ok` when it has none).
+    - `build(code: string, platform: string) string` — The code a piece of Nuclear becomes (with a platform, in its default dialect's language).
+    - `checkProject(root: string) string` — The errors of every file of a project.
+    - `fmt(code: string) string`
+    - `help(word: string, platform: string) string` — `nuclear help <word> [--platform p | --dialect d]`: a kind, decorator, topic or command.
+    - `layout(platform: string) <string, string>` — Where each kind's file goes in a project of the platform (`nuclear help layout`): kind → path.
+    - `pathOf(platform: string, kind: string, name: string, component: string, screen: string) string` — The path of one declaration's file in a project of the platform ("" for an unknown kind).
+    - `brief(platform: string) string` — The short sheet: with a platform, Nuclear and the platform only (what a local agent reads); with a dialect, also the dialect and its language.
+    - `dragonfly(root: string, args: string[], timeout: int) string` — A `dragonfly` command in a project (build, test, check, make, migrate...): its exit code and output.
+- `web.nuc`
+  - `PageText()` — The readable text of a page as its tags go by: what is inside a script, a style, a menu or a code block is left out, and a block starts a line.
+    - `out: string[]`
+    - `skip: int`
+    - `handleStarttag(tag: string, attrs: any[]) void`
+    - `handleEndtag(tag: string) void`
+    - `handleData(data: string) void`
+  - `pageText(html: string) string` — The readable text of a page: no scripts, styles, menus or code blocks.
+  - `withoutCode(text: string) string` — Markdown or plain text without its fenced code blocks.
+  - `publicUrl(url: string) boolean` — An http(s) url whose host resolves only to public addresses (never this machine or the local network).
+  - `clipText(text: string, limit: int) string` — (no description)
+  - `hitText(text: any) string` — A text of a search result without its tags.
+  - `Web(timeout: double)` — The internet for the local agents: search, and read a page as plain text. What comes back is facts for the business logic (a rule, a format, an external API's routes), never code: code blocks are removed, so the agents keep writing only Nuclear. Pages are untrusted text, and a page on this machine or the local network is never read (the graph and the Developer listen on 127.0.0.1).  The search engine, the first one available: SearXNG of your own (`NUCLEAR_SEARXNG_URL`), Brave Search with the key kept by `nuclear-graph web-key brave`, else Wikipedia (no key).
+    - `engine() string` — searxng, brave or wikipedia: the search engine in use.
+    - `hits(query: string, k: int) string[][]` — The first results of a search, each [title, url, text].
+    - `search(query: string, k: int) string` — The first results of a search: `title — url` and a line of text each, or why there are none.
+    - `read(url: string, limit: int) string` — The text of a public page, without code blocks, at most `limit` characters.
+    - `research(query: string, pages: int, limit: int) string` — A search and the text of its first pages, ready for a prompt: the sources first, then each page.
+- `workspace.nuc`
+  - `Workspace(root: string)` — The files of one project, for a local agent, confined to the project's folder: the lite toolbox a coding agent needs to read a project before it writes in it. Read a file, list a folder, find files, search a text, outline a file's declarations, find the files that declare the names a task writes (its context), and give every file that writes a name with another name in its place (a rename). Nothing outside the project is reached; generated, vendored and hidden folders are never read. Answers are short texts a small model can read.  It only reads: an agent's files are written by the Loop, which keeps the ledger that undoes them.
+    - `base: Path`
+    - `parts(path: Path) string[]` — The parts of a path under the project's folder.
+    - `skipped(path: Path) boolean`
+    - `inside(rel: string) Path` — A path of the project, or an error when it is outside it, generated or hidden.
+    - `files(pattern: string) Path[]`
+    - `named(path: Path) string` — The path of a file as the project names it.
+    - `read(path: string, start: int, lines: int) string` — A file's lines, numbered, from `start`, at most `lines` of them.
+    - `list(folder: string) string` — What a folder holds, one name per line (a folder ends with `/`).
+    - `find(pattern: string) string` — The project's files that match a glob (`**/*_repository.nuc`), one path per line.
+    - `grep(text: string, pattern: string, limit: int) string` — The lines that have a text (a regular expression) in the files of a glob: `path:line: text`.
+    - `outline(path: string) string` — The declarations of a `.nuc` file: each with its kind word, its name and its members' signatures.
+    - `declarations() <string, string>` — Every declaration of the project's `.nuc` files: its name → the file that declares it.
+    - `renames(old: string, new: string) <string, string>` — The names a rename changes: `old` itself and every declaration of the project whose name is built from it by putting words before or after (`NewBook`, `BookRepository`, `CreateBook` for `Book`), each with `new` in its place. A framework binds some of them to it by their name (a repository to its entity), so they follow it. A plural (`ListBooks`) is another word and stays.
+    - `renamed(old: string, new: string) <string, string>` — A rename done by a tool, not by a model: every `.nuc` file that writes one of the names the rename changes (`renames`) as a word, as its path → its whole text with the new names. Nothing is written: the caller writes the files (the Loop, which can undo them) and the compiler and the tests say whether a use was missed.
+    - `context(task: string, skip: string, most: int, size: int) string` — The project's files that declare the names a task writes (`BookRepository`, `Book`), each as a ```nuclear block under its path: what a piece depends on. `skip`: the file being written.
+  - `declarationPattern() Regex` — A declaration of a `.nuc` file: its kind word (when it has one) and its name.
+
+## `tests/`
+
+- `tests/support.nuc`
+  - `expect(held: boolean) void` — What a test holds true: it fails at the line that says it when it is not.
+  - `Testing` — What the tests of the graph share: vectors without a model, the least row that is valid, a graph in a folder.
+    - `embed(texts: string[]) double[][]` — A bag of words hashed into 64 dimensions: enough for closest-match tests without a model. The model's prompt words (`title:`, `text:`, `task:`, `query:`) are left out, so a question and a text with its words are close.
+    - `row(id: string, more: <string, any>?) <string, any>` — A valid row with the least to write; `more` gives or replaces fields.
+    - `shelve(store: Store, shelf: string, rows: <string, any>[]) void`
+    - `store(folder: Path) Store`
+    - `http(folder: Path, store: Store, facts: Facts?) TestClient` — The graph's HTTP API over a store and the grants of a folder; the owner's token is `owner-token`.
+    - `auth(token: string) <string, string>`
+    - `loaded(byShelf: <string, <string, any>[]>) <string, Loaded[]>` — The rows of shelves as an ingest loads them.
+- `tests/test_agents.nuc`
+  - `testANameBecomesAFileNameAndAPathFollowsTheLayout() void` — (no description)
+  - `testTheCompilersOutputIsReadAndAModelsAnswerIsItsCode() void` — (no description)
+  - `testTheCompilerChecksAPieceAndGivesThePlatformsLayout() void` — (no description)
+  - `agentProject(tmp: Path) Workspace` — (no description)
+  - `testAnAgentReadsOnlyTheProject(tmpPath: Path) void` — (no description)
+  - `testTheContextOfATaskIsTheFilesThatDeclareItsNamesAndARenameIsDoneByATool(tmpPath: Path) void` — (no description)
+  - `testTheMcpServerOffersItsToolsAndNoneOfTheLocalOnesToAMachineOfRemoteAgents(monkeypatch: any) void` — (no description)
+  - `testASpecIsLedByTheLocalAgentsAndAnApisAnswerIsShownAsAShape() void` — (no description)
+- `tests/test_facts.nuc`
+  - `factRows() <string, <string, any>[]>` — (no description)
+  - `testTheFactsHoldEveryNameAndFieldOfARowAndNeverItsBody() void` — (no description)
+  - `testABrokenQueryOfTheCatalogueIsAProblemOfTheBase() void` — (no description)
+  - `testAnExactQuestionIsAnsweredByItsQueryAndTheRestByTheShelves(tmpPath: Path) void` — (no description)
+  - `testTheCatalogueOfThisTreeIsValid() void` — (no description)
+- `tests/test_graph.nuc`
+  - `testNothingWithoutATokenAndNoBrowsers(tmpPath: Path) void` — (no description)
+  - `testAProgramGetsAccessOnlyWhenTheUserAllowsIt(tmpPath: Path) void` — (no description)
+  - `testDocumentsAreEncryptedAtRestAndFoundByMeaning(tmpPath: Path) void` — (no description)
+  - `testAnAgentWritesOnlyMemoryAndExamples(tmpPath: Path) void` — (no description)
+  - `testARowIsFoundByTheExactNameItCarriesAndReadByItsId(tmpPath: Path) void` — (no description)
+  - `testAQuestionFindsTheCardThatAnswersItOnce(tmpPath: Path) void` — (no description)
+  - `testALocalAgentReadsOnlyItsRowsAndItsPlatform(tmpPath: Path) void` — (no description)
+  - `testARequestGetsTheStrategyOfItsKindAndASpecItsLimits(tmpPath: Path) void` — (no description)
+- `tests/test_knowledge.nuc`
+  - `knowledgeTree(tmp: Path) Context` — A small working tree and an empty knowledge folder beside it; a context that asks nothing of this machine.
+  - `writeCurated(out: Path, rows: <string, any>[]) void` — (no description)
+  - `testRowsAreReadFromTheirSourcesAndABaseIsValidOrNotVersioned(tmpPath: Path) void` — (no description)
+  - `testARevisionRisesOnlyWhenARowChangesAndAHandWrittenRowIsReviewed(tmpPath: Path) void` — (no description)
+  - `testAnOverlayAddsHandWrittenFieldsToGeneratedRows(tmpPath: Path) void` — (no description)
+  - `testAnIngestEmbedsOnlyWhatChangedKeepsWhatAgentsWroteAndFillsTheFacts(tmpPath: Path) void` — (no description)
+  - `testAHelpTextBecomesOneRowPerCommandWithItsUsageAsData() void` — (no description)
+- `tests/test_secrets.nuc`
+  - `testASecretOfAClosedKeyringIsRefusedAndNeverMadeAgain(tmpPath: Path, monkeypatch: any) void` — (no description)

@@ -1,0 +1,284 @@
+use os
+use sys
+use shutil
+use argparse
+use tempfile
+use subprocess
+use importlib
+use tomllib
+use httpx
+use pathlib{ Path }
+
+// The NuclearLang working tree: `NUCLEAR_ROOT`, else the one this checkout is a folder of.
+treeRoot() string
+  given: string = os.environ.get("NUCLEAR_ROOT") ?? ""
+  given.length > 0 ? given : "${Path(__file__).resolve().parents[3]}"
+
+// A module of this package loaded when a command needs it: the client's commands (search, connect...) run without
+// what the server and the MCP server need installed.
+graphPart(name: string) any
+  importlib.importModule("${__package__}.${name}")
+
+// A call to the running graph with the owner's token. `missing`: whether a graph that is not running ends the
+// command (else {} is answered).
+graphCall(method: string, path: string, body: <string, any>? = null, timeout: double = 3600, missing: boolean = true) <string, any>
+  try
+    r = httpx.request(method, "${graphUrl()}${path}", json = body, timeout = timeout, headers = { "Authorization": "Bearer ${Secrets.ownerToken()}" })
+    if r.statusCode >= 400
+      sys.exit("${r.statusCode}: ${r.text}")
+    r.json()
+  catch e
+    if not isinstance(e, httpx.ConnectError)
+      throw e
+    if not missing
+      return {}
+    sys.exit("the graph is not running at ${graphUrl()}: start it with `nuclear-graph serve`")
+
+// Asks the running graph every question of `<out>/questions.toml` (or the ones that contain a word of `only`) and
+// prints which found its row among the first results. 1 when one did not.
+askQuestions(out: Path, only: string[]) int
+  bank: <string, any> = tomllib.loads(out.joinpath("questions.toml").readText())
+  all: <string, any>[] = bank["question"]!
+  questions = all.filter((q) => only.length == 0 or only.any((w) => w.lower() in "${q["ask"]}".lower()))
+  failed = 0
+  first = 0
+  for q in questions
+    request = q["request"] == true
+    exact = q["exact"] == true
+    // a request, not a question: the strategy the graph gives it must be the expected one; a question with one right
+    // answer: the exact query the planner chooses for it must be the expected one
+    top: int = q["top"] ?? (request or exact ? 1 : 3)
+    got: string[] = []
+    if exact
+      told: <string, any>[] = graphCall("POST", "/v1/answer", { "question": q["ask"], "platform": q["platform"] ?? "" })["exact"]!
+      got = told.map((item) => "${item["id"]}")
+    else if request
+      chosen: <string, any>[] = graphCall("POST", "/v1/strategy", { "text": q["ask"], "platform": q["platform"] ?? "", "existing": q["existing"], "new": q["new"] })["items"]!
+      got = chosen.map((item) => "${item["id"]}")
+    else
+      among = "${q["shelves"] ?? ""}"
+      kind = "${q["kind"] ?? ""}"
+      body: <string, any> = { "query": q["ask"], "k": Math.max(top, 5), "platform": q["platform"] ?? "", "agents": q["agents"] ?? true, "shelves": among.length > 0 ? among.split(",") : null, "where": kind.length > 0 ? { "kind": kind } : null }
+      found: <string, any>[] = graphCall("POST", "/v1/search", body)["items"]!
+      got = found.map((item) => "${item["id"]}")
+    expected: string[] = q["expect"]!
+    hit = got.findIndex((id) => expected.any((e) => id == e or (e.endsWith("*") and id.startsWith(e.substring(0, e.length - 1))))) + 1
+    ok = hit > 0 and hit <= top
+    // an open question that reads like an exact one: the planner must leave it to the shelves
+    ran: string[] = []
+    if q["exact"] == false
+      queries: <string, any>[] = graphCall("POST", "/v1/answer", { "question": q["ask"], "platform": q["platform"] ?? "" })["exact"]!
+      ran = queries.map((item) => "${item["id"]}")
+    if not ok
+      failed += 1
+      print("✗ ${q["ask"]}\n    wanted ${expected} in the first ${top}; got ${got}")
+    else if ran.length > 0
+      failed += 1
+      print("✗ ${q["ask"]}\n    an open question: the planner ran ${ran} for it")
+    if hit == 1
+      first += 1
+  print("${questions.length - failed} of ${questions.length} questions found their row (${first} as the first result)")
+  failed > 0 ? 1 : 0
+
+// Compiles every ```nuclear block of the hand-written rows of the base, each alone, for its row's first platform
+// (backend when it names none), and prints the errors. 1 when a block has one.
+checkExamples(out: Path) int
+  blocks = 0
+  bad = 0
+  folder = tempfile.mkdtemp()
+  try
+    file = Path(folder).joinpath("piece.nuc")
+    for shelf, loaded in Assets.load(out)
+      for l in loaded
+        if l.origin == "generated"
+          continue
+        row: <string, any> = l.row
+        named: string[] = row["platforms"] ?? []
+        platform = named.length > 0 ? named[0] : "backend"
+        text = "${Assets.textOf(row["body"])}\n${Assets.textOf(row["add"])}"
+        pieces: string[] = text.split("```nuclear\n")
+        for at in 1..pieces.length
+          code: string = pieces[at].split("```")[0]
+          // a project's manifest (config.nuc) is not a file to check alone
+          if Regex(r"^dragonfly\(", multiline = true).test(code)
+            continue
+          blocks += 1
+          file.writeText(code)
+          told: string = subprocess.run(["nuclear", "check", "${file}", "--platform", platform, "--json"], captureOutput = true, text = true).stdout
+          found: <string, any>[] = graphPart("toolchain").diagnosticsOf(told) ?? []
+          for e in found
+            if e["severity"] == "error"
+              bad += 1
+              print("${shelf} ${row["id"]} #${at} (${platform}): ${e["line"]}:${e["col"]} ${e["code"]} ${e["message"]}")
+  finally
+    shutil.rmtree(folder, ignoreErrors = true)
+  print("${blocks} blocks, ${bad} errors")
+  bad > 0 ? 1 : 0
+
+// The command line of the graph: every command and its options.
+graphParser() any
+  p = argparse.ArgumentParser(prog = "nuclear-graph", description = "`nuclear-graph`: run, fill and guard the Nuclear Smart Graph.")
+  sub = p.addSubparsers(dest = "cmd", required = true)
+  sub.addParser("serve", help = "run the graph on 127.0.0.1 (NUCLEAR_GRAPH_PORT, default 7878)")
+  sub.addParser("mcp", help = "the MCP server on stdio (for Claude Code, Codex, Cursor...)")
+  k = sub.addParser("knowledge", help = "the knowledge base folder (nuclear-developer/data): build its assets from the working tree, check that they are what the tree gives now, record the review of a hand-written row, ask the running graph the questions of questions.toml and see that each finds its row, or compile every Nuclear example of the hand-written rows")
+  k.addArgument("action", choices = ["build", "check", "review", "ask", "examples"])
+  k.addArgument("ids", nargs = "*", help = "review: the rows that still hold (default: every row whose source changed); ask: only the questions that contain one of these words")
+  k.addArgument("--tree", default = treeRoot(), help = "the NuclearLang working tree (default: $NUCLEAR_ROOT or this checkout's)")
+  k.addArgument("--out", default = "", help = "the knowledge folder (default: <tree>/nuclear-developer/data)")
+  i = sub.addParser("ingest", help = "make the knowledge base folder what the graph knows (only what changed is embedded again)")
+  i.addArgument("folder", nargs = "?", default = "", help = "the knowledge folder (default: <tree>/nuclear-developer/data)")
+  s = sub.addParser("search", help = "search the graph: by meaning and by exact name (a code, a command, a kind)")
+  s.addArgument("query")
+  s.addArgument("-c", "--collection", default = "", help = "one shelf (default: every shelf of the knowledge base)")
+  s.addArgument("-k", default = "5")
+  s.addArgument("-p", "--platform", default = "", help = "backend, mobile or web")
+  s.addArgument("--agents", action = "store_true", help = "only what the local agents read")
+  s.addArgument("--full", action = "store_true", help = "print each row whole")
+  an = sub.addParser("answer", help = "what the graph gives for a question before a model answers it: the exact facts of every question with one right answer it is (from the graph's database), then the cards the shelves answer by meaning")
+  an.addArgument("question")
+  an.addArgument("-p", "--platform", default = "", help = "backend, mobile or web")
+  an.addArgument("--history", default = "", help = "the messages before it, as `you: ...` lines")
+  st = sub.addParser("strategy", help = "which kind of request a text is (a whole system, one screen, a rename, a failing test...) and its plan")
+  st.addArgument("request")
+  st.addArgument("-p", "--platform", default = "", help = "backend, mobile or web")
+  st.addArgument("--full", action = "store_true", help = "print the plan of the strategy")
+  c0 = sub.addParser("card", help = "one row of the knowledge base by its id (error:N0114, kind:backend.usecase), with what it links to")
+  c0.addArgument("id")
+  sub.addParser("stats", help = "the rows of each collection and the revision of the knowledge base the graph holds")
+  c = sub.addParser("connect", help = "give a client (a program) access and keep its token in the keyring")
+  c.addArgument("client")
+  c.addArgument("--scopes", default = "read", help = "read,write (admin only for the owner)")
+  c.addArgument("--print", action = "store_true", help = "print the token instead of keeping it")
+  allow = sub.addParser("allow", help = "allow a pending request")
+  allow.addArgument("request")
+  deny = sub.addParser("deny", help = "deny a pending request")
+  deny.addArgument("request")
+  w = sub.addParser("web-key", help = "keep the key of a search engine for the local agents (read from stdin): brave")
+  w.addArgument("engine", choices = ["brave"])
+  sub.addParser("requests", help = "pending access requests and the allowed clients")
+  r = sub.addParser("revoke", help = "take a client's access away")
+  r.addArgument("client")
+  p
+
+// The help of this package's own command line (never of another copy on the PATH).
+graphHelp() string
+  os.environ.setdefault("COLUMNS", "100")
+  graphParser().formatHelp()
+
+// What the knowledge base reads of this machine: the MCP server's tools and the HTTP routes, each from its module.
+knowledgeContext(tree: Path, out: Path) Context
+  Knowledge.context(tree, out, () => graphPart("mcp_server").mcpTools(), graphHelp, () => graphPart("server").graphRoutes())
+
+knowledgeCommand(args: any) void
+  tree: Path = Path(args.tree).resolve()
+  folder = "${args.out}"
+  out: Path = folder.length > 0 ? Path(folder).resolve() : tree.joinpath("nuclear-developer", "data")
+  action = "${args.action}"
+  ids: string[] = args.ids
+  if action == "ask"
+    sys.exit(askQuestions(out, ids))
+  if action == "examples"
+    sys.exit(checkExamples(out))
+  ctx = knowledgeContext(tree, out)
+  if action == "build"
+    r = Knowledge.build(out, ctx)
+    problems: string[] = r["problems"]!
+    if problems.length > 0
+      print(problems.join("\n"))
+      sys.exit("${problems.length} problem(s): nothing was versioned")
+    print("revision ${r["revision"]}: ${r["rows"]} rows (${r["added"]} added, ${r["changed"]} changed, ${r["removed"]} removed) → ${out}")
+    sizes: <string, any> = r["shelves"]!
+    print("  ${sizes.keys.map((shelf) => "${shelf} ${sizes[shelf]}").join(", ")}")
+    review: string[] = r["review"]!
+    print(review.join("\n"))
+  else if action == "review"
+    done: string[] = Knowledge.review(out, ids, ctx)
+    print(done.length > 0 ? done.map((id) => "reviewed: ${id}").join("\n") : "no row was waiting for a review")
+  else
+    behind: string[] = Knowledge.check(out, ctx)
+    held = graphCall("GET", "/v1/stats", timeout = 5, missing = false)["knowledge"]
+    want: int = Knowledge.readManifest(out)["revision"]!
+    if held != null and held["revision"] != want
+      behind.add("the graph holds revision ${held["revision"]} and the knowledge base is revision ${want}: `nuclear-graph ingest`")
+    print(behind.length > 0 ? behind.join("\n") : "${out}: revision ${want}, every row is what the tree gives now${held != null ? " and the graph holds it" : " (the graph is not running)"}")
+    sys.exit(behind.length > 0 ? 1 : 0)
+
+connectCommand(client: string, scopes: string, show: boolean) void
+  token = Access().grant(client, scopes.split(","))
+  if show
+    print(token)
+  else if Secrets.keyringSet("client:${client}", token)
+    print("'${client}' can use the graph (${scopes}); its token is in the keyring")
+  else
+    file = Paths.home().joinpath(".client-${client}")
+    Secrets.write(file, token)
+    print("no keyring: the token of '${client}' is in ${file} (only you can read it)")
+
+// `nuclear-graph`: run, fill and guard the Nuclear Smart Graph.
+main(argv: string[]? = null) void
+  args = graphParser().parseArgs(argv)
+  cmd = "${args.cmd}"
+  if cmd == "serve"
+    // the web server is a library of its own, loaded only to serve
+    importlib.importModule("uvicorn").run(graphPart("server").graphApp(), host = "127.0.0.1", port = graphPort(), logLevel = "warning")
+  else if cmd == "mcp"
+    graphPart("mcp_server").mcpMain()
+  else if cmd == "ingest"
+    given = "${args.folder}"
+    folder: Path = given.length > 0 ? Path(given).resolve() : Path(treeRoot()).resolve().joinpath("nuclear-developer", "data")
+    out = graphCall("POST", "/v1/ingest", { "roots": ["${folder}"] })
+    log: string[] = out.remove("log") ?? []
+    print(log.join("\n"))
+    print(json.dumps(out, indent = 2))
+  else if cmd == "search"
+    body: <string, any> = { "query": args.query, "collection": args.collection, "k": "${args.k}".toInt() ?? 5, "platform": args.platform, "agents": args.agents }
+    found: <string, any>[] = graphCall("POST", "/v1/search", body)["items"]!
+    for item in found
+      score: double = item["score"]!
+      distance: double = item["distance"]!
+      text = "${item["text"]}"
+      print("── ${score.toFixed(3)} (${distance.toFixed(3)} ${item["via"]})  ${item["shelf"]}  ${item["id"]}")
+      print("${args.full ? text : text.substring(0, Math.min(600, text.length))}\n")
+  else if cmd == "strategy"
+    fits: <string, any>[] = graphCall("POST", "/v1/strategy", { "text": args.request, "platform": args.platform })["items"]!
+    for at in 0..fits.length
+      points: double = fits[at]["score"]!
+      why = "${fits[at]["why"]}"
+      print("${at == 0 ? "→" : " "} ${points.toFixed(2).padStart(5)}  ${fits[at]["id"]}  (${why.length > 0 ? why : "by meaning"})")
+    if fits.length > 0 and args.full
+      print("\n${fits[0]["text"]}")
+  else if cmd == "answer"
+    plan = graphCall("POST", "/v1/answer", { "question": args.question, "platform": args.platform, "history": args.history, "agents": false })
+    exact: <string, any>[] = plan["exact"] ?? []
+    for query in exact
+      print("── exact: ${query["id"]} (${query["told"]}) · ${query["total"]} rows · ${query["why"]}")
+    needs: string[] = plan["needs"] ?? []
+    for need in needs
+      print("── close, lacks a name: ${need}")
+    print("\n${plan["facts"]}\n")
+    cards: <string, any>[] = plan["cards"] ?? []
+    for item in cards
+      print("── card: ${item["shelf"]}  ${item["id"]}")
+  else if cmd == "card"
+    print(asText([graphCall("GET", "/v1/cards/${args.id}")]))
+  else if cmd == "stats"
+    print(json.dumps(graphCall("GET", "/v1/stats"), indent = 2))
+  else if cmd == "connect"
+    connectCommand("${args.client}", "${args.scopes}", getattr(args, "print") == true)
+  else if cmd == "allow" or cmd == "deny"
+    Access().decide("${args.request}", cmd == "allow")
+    print("request ${args.request}: ${cmd == "allow" ? "allowed" : "denied"}")
+  else if cmd == "requests"
+    access = Access()
+    print(json.dumps({ "requests": access.requests(), "clients": access.clients() }, indent = 2))
+  else if cmd == "knowledge"
+    knowledgeCommand(args)
+  else if cmd == "web-key"
+    key: string = sys.stdin.readline()
+    if key.trim().length == 0
+      sys.exit("give the key on stdin: nuclear-graph web-key brave < key.txt")
+    Secrets.keep("search:${args.engine}", key.trim())
+    print("the local agents now search with ${args.engine}")
+  else if cmd == "revoke"
+    print(Access().revoke("${args.client}") ? "revoked" : "no client '${args.client}'")

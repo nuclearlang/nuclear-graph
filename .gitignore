@@ -2,3 +2,6 @@
 __pycache__/
 *.egg-info/
 dist/
+# what `nuclear build .` writes from the .nuc files: never edited, never kept
+build/
+.pytest_cache/

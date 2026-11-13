@@ -1,0 +1,87 @@
+use asyncio
+use pathlib{ Path }
+
+// What the local agents use besides the graph: the compiler's tools, a project's files, the MCP server.
+
+testANameBecomesAFileNameAndAPathFollowsTheLayout() void
+  expect(snake("BooksOfAuthor") == "books_of_author" and snake("HTTPClient") == "http_client" and snake("Book") == "book")
+  layout = { "usecase": "components/{component}/domain/usecases/{file}.nuc", "screen": "components/{component}/presentation/{screen}/{file}.nuc" }
+  expect(layoutPath(layout, "usecase", "ListBooks", "Books") == "components/books/domain/usecases/list_books.nuc")
+  expect(layoutPath(layout, "screen", "BookList", "books", "BookScreen") == "components/books/presentation/book_screen/book_list.nuc")
+  expect(layoutPath(layout, "nope", "X", "y") == "")
+  expect(target("backend") == ["--platform", "backend"] and target("fastapi") == ["--dialect", "fastapi"])
+
+testTheCompilersOutputIsReadAndAModelsAnswerIsItsCode() void
+  out = "[]\nnoise [{\"severity\": \"error\", \"line\": 1, \"col\": 2, \"code\": \"N0114\", \"message\": \"m [x]\", \"fix\": \"use add\", \"file\": \"a.nuc\"}]\n[{\"severity\": \"warning\"}] tail [not json"
+  found = diagnosticsOf(out)
+  expect(found != null and describe(found!) == "a.nuc:1:2 N0114 m [x] (fix: use add)")
+  expect(diagnosticsOf("nothing here") == null and describe([]) == "ok")
+  expect(stripFences("text\n```nuclear\nmodel A\n  n: int\n```\nmore") == "model A\n  n: int\n")
+  expect(stripFences("  plain  ") == "plain\n")
+
+testTheCompilerChecksAPieceAndGivesThePlatformsLayout() void
+  tools = Toolchain()
+  expect(asyncio.run(tools.check("model NewBook\n  title: string\n", "backend")) == "ok")
+  told: string = asyncio.run(tools.check("model A\n  n: string\n  size() int\n    n.lenght\n", "backend"))
+  expect("N0114" in told and not ("piece.nuc" in told))
+  where: <string, string> = asyncio.run(tools.layout("backend"))
+  expect(where["usecase"] == "components/{component}/domain/usecases/{file}.nuc")
+  expect(asyncio.run(tools.pathOf("backend", "usecase", "ListBooks", "books")) == "components/books/domain/usecases/list_books.nuc")
+
+agentProject(tmp: Path) Workspace
+  files = {
+    "config.nuc": "dragonfly(platform = \"backend\", dialect = \"fastapi\")\n",
+    "components/books/domain/models/book.nuc": "// A book of the shelf.\nBook\n  id: int\n  title: string\n",
+    "components/books/data/book_repository.nuc": "repository BookRepository\n  byTitle(title: string) Result<Error, Book>\n    where({ \"title\": title })\n    getOne()\n",
+    "components/books/domain/usecases/find_book.nuc": "usecase FindBook(books: BookRepository)\n  exec(title: string) Result<Error, Book>\n    ~books.byTitle(title)\n",
+    "build/app/book.py": "class Book: ...\n",
+    ".nuclear/map.md": "hidden\n",
+  }
+  for rel, text in files
+    file = tmp.joinpath(rel)
+    file.parent.mkdir(parents = true, existOk = true)
+    file.writeText(text)
+  Workspace("${tmp}")
+
+testAnAgentReadsOnlyTheProject(tmpPath: Path) void
+  files = agentProject(tmpPath)
+  expect(files.read("components/books/domain/models/book.nuc").startsWith("   1  // A book of the shelf."))
+  expect(files.read("../outside.txt").startsWith("not read:") and files.read("build/app/book.py").startsWith("not read:"))
+  expect(files.list() == "components/\nconfig.nuc" and files.list("build").startsWith("not listed:"))
+  expect(files.find("**/*_repository.nuc") == "components/books/data/book_repository.nuc")
+  expect(files.grep("byTitle") == "components/books/data/book_repository.nuc:2: byTitle(title: string) Result<Error, Book>\ncomponents/books/domain/usecases/find_book.nuc:3: ~books.byTitle(title)")
+  expect(files.outline("components/books/domain/usecases/find_book.nuc") == "usecase FindBook(books: BookRepository)\n  exec(title: string) Result<Error, Book>")
+
+testTheContextOfATaskIsTheFilesThatDeclareItsNamesAndARenameIsDoneByATool(tmpPath: Path) void
+  files = agentProject(tmpPath)
+  expect(files.declarations() == { "BookRepository": "components/books/data/book_repository.nuc", "Book": "components/books/domain/models/book.nuc", "FindBook": "components/books/domain/usecases/find_book.nuc" })
+  context = files.context("A use case CountBooks(books: BookRepository) that counts every Book", skip = "components/books/domain/models/book.nuc")
+  expect(context.startsWith("```nuclear\n// components/books/data/book_repository.nuc\nrepository BookRepository") and not ("// A book of the shelf." in context))
+  expect(files.renames("Book", "Title") == { "Book": "Title", "BookRepository": "TitleRepository", "FindBook": "FindTitle" })
+  renamed = files.renamed("Book", "Title")
+  expect(renamed["components/books/domain/usecases/find_book.nuc"] == "usecase FindTitle(books: TitleRepository)\n  exec(title: string) Result<Error, Title>\n    ~books.byTitle(title)\n")
+  expect(renamed.length == 3)
+
+testTheMcpServerOffersItsToolsAndNoneOfTheLocalOnesToAMachineOfRemoteAgents(monkeypatch: any) void
+  monkeypatch.setenv("NUCLEAR_AI_MODE", "local")
+  names: string[] = []
+  for tool in asyncio.run(mcpServer().listTools())
+    names.add(tool.name)
+  expect("graph_answer" in names and "generate_resource" in names and "developer_task" in names)
+  // every tool is in the README and in the documentation of the MCP server
+  readme: string = Path(treeRoot()).joinpath("nuclear-graph", "README.md").readText()
+  page: string = Path(treeRoot()).joinpath("docs", "ai", "mcp.md").readText()
+  for name in names
+    expect("`${name}" in readme and "`${name}" in page)
+  monkeypatch.setenv("NUCLEAR_AI_MODE", "remote")
+  remote: string[] = []
+  for tool in asyncio.run(mcpServer().listTools())
+    remote.add(tool.name)
+  expect(remote.length > 10 and not remote.any((name) => name.startsWith("graph_") or name.startsWith("developer_")))
+
+testASpecIsLedByTheLocalAgentsAndAnApisAnswerIsShownAsAShape() void
+  spec = specMarkdown("Loans", " A reader borrows a book. ", ["a book out is not lent"], "feature")
+  expect(spec == "# Loans\n\n- Use case: feature\n- Source: local\n- Lead: local agents only\n\n## Description\n\nA reader borrows a book.\n\n## Acceptance criteria\n\n- [ ] a book out is not lent\n")
+  value = { "info": { "count": 3, "next": null }, "results": [{ "id": 1, "name": "x", "tags": [] }] }
+  expect(shape(value) == "info: object\n  count: int\n  next: null (optional)\nresults: list of\n  id: int\n  name: string\n  tags: empty list")
+  expect(ExtractTools.runs("\n  generateResource(project: string) string\n    args = [\"gen\", \"resource\", component]\n    ~tools.dragonfly(project, args)\n", "generate_resource") == "dragonfly gen resource")

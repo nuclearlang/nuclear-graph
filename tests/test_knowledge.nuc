@@ -1,0 +1,141 @@
+use pathlib{ Path }
+
+// The knowledge base as a folder: what is generated from the tree, what is written by hand, its versions, its ingest.
+
+SECTIONS = """
+exclude = ["spec/diagnostics.md"]
+[[section]]
+id = "02-language"
+title = "The language"
+shelf = "language"
+files = ["spec/nuclear-base.md"]
+[[section]]
+id = "02-targets"
+title = "Targets"
+agents = false
+files = ["spec/python.md"]
+"""
+CODES = """
+    pub const LIBRARY_NAME: Code = Code {
+        id: "N0114",
+        title: "not a member of Nuclear's standard library",
+        explanation: "The members are Nuclear's own: a target's name (push) is replaced by the \\"Nuclear\\" one.",
+    };
+"""
+
+// A small working tree and an empty knowledge folder beside it; a context that asks nothing of this machine.
+knowledgeTree(tmp: Path) Context
+  root = tmp.joinpath("tree")
+  out = tmp.joinpath("data")
+  files = {
+    "spec/nuclear-base.md": "# Base\n\nBlocks are indented.\n\n## Lists\n\nA list is `[1, 2]`, never this:\n\n```python\nxs.append(1)\n```\n\nUse `add`, a method of every list in Nuclear.\n",
+    "spec/python.md": "# Python\n\nWhat Nuclear becomes in Python, with every rule of the dialect.\n",
+    "spec/diagnostics.md": "# Diagnostics\n\n## Resolver\n\n| Code | Error | Example | Fix |\n|---|---|---|---|\n| N0114 | Not a member of the library | `xs.push(x)` | `add(x)` |\n",
+    "crates/nuclear-diag/src/lib.rs": CODES,
+    "docs/aprende/x.md": "private teaching material, never part of the base",
+  }
+  for rel, text in files
+    file = root.joinpath(rel)
+    file.parent.mkdir(parents = true, existOk = true)
+    file.writeText(text)
+  out.joinpath("assets", "concepts").mkdir(parents = true)
+  out.joinpath("sections.toml").writeText(SECTIONS)
+  ctx = Knowledge.context(root, out, () => { "instructions": "", "tools": [] }, () => "", () => [])
+  ctx.run = (cmd: string[]) => null
+  ctx
+
+writeCurated(out: Path, rows: <string, any>[]) void
+  Assets.writeFile(out.joinpath("assets", "concepts", "purpose.json"), "concepts", "curated", "by hand", rows)
+
+testRowsAreReadFromTheirSourcesAndABaseIsValidOrNotVersioned(tmpPath: Path) void
+  ctx = knowledgeTree(tmpPath)
+  out = tmpPath.joinpath("data")
+  built = Knowledge.build(out, ctx, today = "2026-01-01")
+  expect(built["problems"] == [] and built["revision"] == 1)
+  rows: <string, any>[] = Assets.readFile(out.joinpath("assets", "errors", "diagnostics.json"))["rows"]!
+  expect(rows[0]["id"] == "error:N0114" and rows[0]["meta"] == { "code": "N0114", "family": "resolver", "severity": "error" })
+  expect(rows[0]["data"]["fix"] == "`add(x)`" and "the \"Nuclear\" one" in "${rows[0]["body"]}")
+  // a row the local agents read has no code of a target language; the private teaching material is never a row
+  guide: <string, any>[] = Assets.readFile(out.joinpath("assets", "language", "02-language.json"))["rows"]!
+  expect(guide.all((row) => not ("xs.append" in "${row["body"]}")))
+  index: string = out.joinpath("INDEX.md").readText()
+  expect("error:N0114" in index and not ("aprende" in index))
+  // a link to a row that does not exist: nothing is versioned
+  writeCurated(out, [Testing.row("concept:broken", { "type": "concept", "links": [{ "rel": "see", "to": "concept:nowhere" }] })])
+  again = Knowledge.build(out, ctx)
+  problems: string[] = again["problems"]!
+  expect(problems.length == 1 and "links to `concept:nowhere`" in problems[0] and not ("revision" in again))
+
+testARevisionRisesOnlyWhenARowChangesAndAHandWrittenRowIsReviewed(tmpPath: Path) void
+  ctx = knowledgeTree(tmpPath)
+  out = tmpPath.joinpath("data")
+  writeCurated(out, [Testing.row("concept:lists", { "type": "concept", "sources": ["spec/nuclear-base.md#Lists"] })])
+  expect(Knowledge.build(out, ctx, today = "2026-01-01")["revision"] == 1)
+  same = Knowledge.build(out, ctx, today = "2026-01-02")
+  expect(same["revision"] == 1 and same["changed"] == 0)
+  clean: string[] = Knowledge.check(out, ctx)
+  expect(clean.length == 0)
+  // the section the row was written from changes: the row is to be reviewed, and a review records that it holds
+  spec = ctx.tree.joinpath("spec", "nuclear-base.md")
+  spec.writeText("${spec.readText()}\nA list keeps its order.\n")
+  ctx.problems.clear()
+  moved = Knowledge.build(out, ctx, today = "2026-01-03")
+  review: string[] = moved["review"]!
+  expect(moved["revision"] == 2 and review.length == 1 and "`concept:lists` was written from spec/nuclear-base.md#Lists" in review[0])
+  expect(Knowledge.review(out, [], ctx) == ["concept:lists"])
+  ctx.problems.clear()
+  held: string[] = Knowledge.check(out, ctx)
+  expect(held.length == 0)
+  // a generated file edited by hand is not what the tree gives
+  file = out.joinpath("assets", "errors", "diagnostics.json")
+  file.writeText(file.readText().replaceAll("N0114 —", "N0114 (edited) —"))
+  ctx.problems.clear()
+  stale: string[] = Knowledge.check(out, ctx)
+  expect(stale.any((line) => line.startsWith("stale: assets/errors/diagnostics.json is not what the tree gives now")))
+
+testAnOverlayAddsHandWrittenFieldsToGeneratedRows(tmpPath: Path) void
+  ctx = knowledgeTree(tmpPath)
+  out = tmpPath.joinpath("data")
+  out.joinpath("assets", "errors").mkdir(parents = true)
+  out.joinpath("assets", "errors", "diagnostics.overlay.json").writeText(json.dumps({ "shelf": "errors", "origin": "overlay", "rows": [{ "id": "error:N0114", "keys": ["push"], "add": "Right: `xs.add(x)`.", "meta": { "kinds": ["usecase"] } }, { "id": "error:N9999", "tags": ["gone"] }] }))
+  built = Knowledge.build(out, ctx)
+  problems: string[] = built["problems"]!
+  expect(problems.length == 1 and "`error:N9999` is not a row of errors/diagnostics.json any more" in problems[0])
+  generated = Knowledge.generated(out, ctx, [])
+  row: <string, any> = generated["errors/diagnostics"]![1][0]
+  keys: string[] = row["keys"]!
+  meta: <string, any> = row["meta"]!
+  expect("push" in keys and "n0114" in keys and "${row["body"]}".endsWith("Right: `xs.add(x)`."))
+  expect(meta["kinds"] == ["usecase"] and meta["code"] == "N0114")
+
+testAnIngestEmbedsOnlyWhatChangedKeepsWhatAgentsWroteAndFillsTheFacts(tmpPath: Path) void
+  ctx = knowledgeTree(tmpPath)
+  out = tmpPath.joinpath("data")
+  Knowledge.build(out, ctx)
+  store = Testing.store(tmpPath)
+  facts = Facts()
+  log: string[] = []
+  first = Ingest.ingest(store, out, (line: string) => log.add(line), facts)
+  expect(first["errors"] == { "added": 1, "kept": 0, "removed": 0 } and first["version"] == { "schema": 1, "revision": 1 })
+  expect(first["facts"]["cards"] > 0 and facts.run("SELECT code, fix FROM diagnostics") == [{ "code": "N0114", "fix": "`add(x)`" }])
+  store.put("errors", [["note-1", "what an agent kept", { "origin": "runtime", "hash": "x" }]])
+  second = Ingest.ingest(store, out, (line: string) => log.add(line), facts)
+  expect(second["errors"] == { "added": 0, "kept": 1, "removed": 0 } and "note-1" in store.hashes("errors"))
+  // a folder that is not a knowledge base, or an invalid one, is refused whole
+  refused = false
+  try
+    Ingest.ingest(store, tmpPath, (line: string) => log.add(line))
+  catch e
+    refused = "is not a knowledge base" in "${e}"
+  expect(refused)
+
+testAHelpTextBecomesOneRowPerCommandWithItsUsageAsData() void
+  help = "usage: tool <command>\n\nproject\n  build [target]              transpile and build\n      [--release]             with optimisations\n  new <name>             (n)  a new project\n\ncode generation: tool make <what> ...\n  usecase <component> <name>  (uc) a use case\n"
+  entries = ExtractTools.entries(help)
+  expect(entries.map((entry) => entry.heading) == ["project", "project", "code generation: tool make <what> ..."])
+  row = ExtractTools.toolRow("tool", "build", [entries[0].lines], ["src"])
+  expect(row["id"] == "tool:tool.build" and row["summary"] == "Transpile and build with optimisations")
+  expect(row["data"]["entries"][0]["usage"] == "tool build [target]" and row["data"]["entries"][0]["what"] == "build")
+  made = ExtractTools.entryOf(entries[2].lines, "tool make")
+  expect(made == { "what": "usecase", "usage": "tool make usecase <component> <name>", "alias": "uc", "note": "", "does": "A use case" })
+  expect(ExtractTools.entryOf(entries[1].lines, "tool")["alias"] == "n")

@@ -1,0 +1,320 @@
+use sqlite3
+use threading
+
+// The tables of the exact facts. `cards`: every row of the knowledge base (never its body: that stays sealed in the
+// store). `platforms`, `keys`, `links`: its lists. `fields`: every field of its `meta` and `data` that is a value or a
+// list of values (`n`: its place in the list). `items`: every list of objects of its `data`, one row per field of
+// each object (`list`: the list's name, `n`: the object's place).
+SCHEMA_SQL = """
+CREATE TABLE cards(id TEXT PRIMARY KEY, shelf TEXT NOT NULL, type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, agents INTEGER NOT NULL, origin TEXT NOT NULL);
+CREATE TABLE platforms(card TEXT NOT NULL, platform TEXT NOT NULL);
+CREATE TABLE keys(card TEXT NOT NULL, key TEXT NOT NULL);
+CREATE TABLE links(card TEXT NOT NULL, rel TEXT NOT NULL, target TEXT NOT NULL);
+CREATE TABLE fields(card TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, n INTEGER NOT NULL);
+CREATE TABLE items(card TEXT NOT NULL, list TEXT NOT NULL, n INTEGER NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL);
+CREATE TABLE about(name TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE INDEX cards_type ON cards(type);
+CREATE INDEX platforms_card ON platforms(card);
+CREATE INDEX keys_key ON keys(key);
+CREATE INDEX links_card ON links(card);
+CREATE INDEX fields_card ON fields(card, name);
+CREATE INDEX fields_value ON fields(name, value);
+CREATE INDEX items_card ON items(card, list, n);
+CREATE INDEX items_value ON items(list, field, value);
+"""
+// The model the exact questions read: one view per thing of the ecosystem that has a name and fields of its own (a
+// command, a tool of the MCP server and its parameters, a route, a kind, a decorator, a plugin, a dialect, what a
+// generator writes, where a kind's file goes, a diagnostic, a habit, a member of the library, a stage of the Loop, a
+// local agent, a component's version, an editor command, a strategy, a capability). The catalogue of the base
+// (the `queries` shelf) reads these names; `field` is a row's first value of a field.
+VIEWS_SQL = """
+CREATE VIEW field AS SELECT card, name, MIN(value) AS value FROM fields WHERE n = 0 GROUP BY card, name;
+CREATE VIEW commands AS
+  SELECT MIN(u.card) AS card, t.value AS tool, w.value AS what, u.value AS usage, a.value AS alias, o.value AS note, d.value AS does
+  FROM items u JOIN cards c ON c.id = u.card AND c.type = 'cli' JOIN field t ON t.card = u.card AND t.name = 'tool'
+  JOIN items w ON w.card = u.card AND w.list = 'entries' AND w.n = u.n AND w.field = 'what'
+  JOIN items a ON a.card = u.card AND a.list = 'entries' AND a.n = u.n AND a.field = 'alias'
+  JOIN items o ON o.card = u.card AND o.list = 'entries' AND o.n = u.n AND o.field = 'note'
+  JOIN items d ON d.card = u.card AND d.list = 'entries' AND d.n = u.n AND d.field = 'does'
+  WHERE u.list = 'entries' AND u.field = 'usage' GROUP BY t.value, u.value;
+CREATE VIEW mcp_tools AS
+  SELECT c.id AS card, n.value AS tool, g.value AS grp, r.value AS runs, c.summary AS does
+  FROM cards c JOIN field n ON n.card = c.id AND n.name = 'name' JOIN field g ON g.card = c.id AND g.name = 'group' LEFT JOIN field r ON r.card = c.id AND r.name = 'runs'
+  WHERE c.type = 'mcp';
+CREATE VIEW mcp_params AS
+  SELECT t.tool AS tool, p.n AS n, p.value AS name, y.value AS type, q.value AS required, f.value AS fallback
+  FROM mcp_tools t JOIN items p ON p.card = t.card AND p.list = 'params' AND p.field = 'name'
+  JOIN items y ON y.card = p.card AND y.list = 'params' AND y.n = p.n AND y.field = 'type'
+  JOIN items q ON q.card = p.card AND q.list = 'params' AND q.n = p.n AND q.field = 'required'
+  JOIN items f ON f.card = p.card AND f.list = 'params' AND f.n = p.n AND f.field = 'default';
+CREATE VIEW routes AS
+  SELECT c.id AS card, s.value AS service, v.value AS verb, p.value AS path, o.value AS scope, c.summary AS does
+  FROM cards c JOIN field s ON s.card = c.id AND s.name = 'service' JOIN field v ON v.card = c.id AND v.name = 'verb'
+  JOIN field p ON p.card = c.id AND p.name = 'path' JOIN field o ON o.card = c.id AND o.name = 'scope' WHERE c.type = 'http';
+CREATE VIEW kinds AS
+  SELECT c.id AS card, p.value AS platform, k.value AS kind, f.value AS file, c.summary AS does
+  FROM cards c JOIN field p ON p.card = c.id AND p.name = 'platform' JOIN field k ON k.card = c.id AND k.name = 'kind'
+  LEFT JOIN field f ON f.card = c.id AND f.name = 'file' WHERE c.type = 'kind';
+CREATE VIEW kind_names AS
+  SELECT k.platform AS platform, k.kind AS kind, lower(k.kind) AS name FROM kinds k
+  UNION SELECT k.platform, k.kind, y.key FROM kinds k JOIN keys y ON y.card = k.card;
+CREATE VIEW kind_decorators AS
+  SELECT k.platform AS platform, k.kind AS kind, d.value AS decorator FROM kinds k JOIN fields d ON d.card = k.card AND d.name = 'decorators';
+CREATE VIEW decorators AS
+  SELECT c.id AS card, p.value AS platform, d.value AS decorator, c.summary AS does,
+    (SELECT group_concat(a.value, ', ') FROM fields a WHERE a.card = c.id AND a.name = 'args') AS args
+  FROM cards c JOIN field p ON p.card = c.id AND p.name = 'platform' JOIN field d ON d.card = c.id AND d.name = 'decorator' WHERE c.type = 'decorator';
+CREATE VIEW plugins AS
+  SELECT c.id AS card, p.value AS platform, g.value AS plugin, c.summary AS does,
+    (SELECT group_concat(k.value, ', ') FROM fields k WHERE k.card = c.id AND k.name = 'kinds') AS kinds,
+    (SELECT group_concat(r.value, ', ') FROM fields r WHERE r.card = c.id AND r.name = 'requires') AS requires
+  FROM cards c JOIN field p ON p.card = c.id AND p.name = 'platform' JOIN field g ON g.card = c.id AND g.name = 'plugin' WHERE c.type = 'plugin';
+CREATE VIEW dialects AS
+  SELECT p.value AS platform, d.value AS dialect, CASE WHEN d.value = f.value THEN 'default' ELSE '' END AS chosen, c.summary AS does
+  FROM cards c JOIN field p ON p.card = c.id AND p.name = 'platform' JOIN fields d ON d.card = c.id AND d.name = 'dialects'
+  JOIN field f ON f.card = c.id AND f.name = 'default_dialect' WHERE c.type = 'platform';
+CREATE VIEW generator_pieces AS
+  SELECT p.value AS platform, m.value AS command, k.n AS n, k.value AS kind, w.value AS name, i.value AS condition, e.value AS each, g.value AS merge
+  FROM cards c JOIN field p ON p.card = c.id AND p.name = 'platform' JOIN field m ON m.card = c.id AND m.name = 'command'
+  JOIN items k ON k.card = c.id AND k.list = 'pieces' AND k.field = 'kind'
+  JOIN items w ON w.card = c.id AND w.list = 'pieces' AND w.n = k.n AND w.field = 'name'
+  JOIN items i ON i.card = c.id AND i.list = 'pieces' AND i.n = k.n AND i.field = 'when'
+  JOIN items e ON e.card = c.id AND e.list = 'pieces' AND e.n = k.n AND e.field = 'each'
+  JOIN items g ON g.card = c.id AND g.list = 'pieces' AND g.n = k.n AND g.field = 'merge'
+  WHERE c.type = 'generator';
+CREATE VIEW layout AS
+  SELECT p.value AS platform, k.value AS kind, f.value AS file
+  FROM cards c JOIN field p ON p.card = c.id AND p.name = 'platform' JOIN items k ON k.card = c.id AND k.list = 'files' AND k.field = 'kind'
+  JOIN items f ON f.card = c.id AND f.list = 'files' AND f.n = k.n AND f.field = 'file' WHERE c.type = 'layout';
+CREATE VIEW diagnostics AS
+  SELECT c.id AS card, o.value AS code, f.value AS family, s.value AS stage, v.value AS severity, t.value AS title, w.value AS what, x.value AS fix, e.value AS example
+  FROM cards c JOIN field o ON o.card = c.id AND o.name = 'code' JOIN field f ON f.card = c.id AND f.name = 'family'
+  JOIN field s ON s.card = c.id AND s.name = 'stage' JOIN field v ON v.card = c.id AND v.name = 'severity' JOIN field t ON t.card = c.id AND t.name = 'title'
+  JOIN field w ON w.card = c.id AND w.name = 'what' LEFT JOIN field x ON x.card = c.id AND x.name = 'fix' LEFT JOIN field e ON e.card = c.id AND e.name = 'example'
+  WHERE c.type = 'diagnostic';
+CREATE VIEW habits AS
+  SELECT c.id AS card, w.value AS wrong, r.value AS right, n.value AS note
+  FROM cards c JOIN field w ON w.card = c.id AND w.name = 'wrong' JOIN field r ON r.card = c.id AND r.name = 'right' LEFT JOIN field n ON n.card = c.id AND n.name = 'note'
+  WHERE c.type = 'habit';
+CREATE VIEW library AS
+  SELECT b.value AS base, m.n AS n, m.value AS member, CASE WHEN p.value = 'true' THEN 'property' ELSE 'method' END AS shape, g.value AS gives
+  FROM cards c JOIN field b ON b.card = c.id AND b.name = 'base' JOIN items m ON m.card = c.id AND m.list = 'members' AND m.field = 'name'
+  JOIN items p ON p.card = c.id AND p.list = 'members' AND p.n = m.n AND p.field = 'property'
+  JOIN items g ON g.card = c.id AND g.list = 'members' AND g.n = m.n AND g.field = 'gives' WHERE c.type = 'library';
+CREATE VIEW foreign_names AS
+  SELECT b.value AS base, w.value AS name, x.value AS fix
+  FROM cards c JOIN field b ON b.card = c.id AND b.name = 'base' JOIN items w ON w.card = c.id AND w.list = 'wrong' AND w.field = 'name'
+  JOIN items x ON x.card = c.id AND x.list = 'wrong' AND x.n = w.n AND x.field = 'fix' WHERE c.type = 'library';
+CREATE VIEW stages AS
+  SELECT c.id AS card, CAST(o.value AS INTEGER) AS position, s.value AS stage, t.value AS title, n.value AS next, c.summary AS does,
+    (SELECT group_concat(a.value, ', ') FROM fields a WHERE a.card = c.id AND a.name = 'actors') AS actors
+  FROM cards c JOIN field o ON o.card = c.id AND o.name = 'order' JOIN field s ON s.card = c.id AND s.name = 'stage'
+  JOIN field t ON t.card = c.id AND t.name = 'title' LEFT JOIN field n ON n.card = c.id AND n.name = 'next' WHERE c.type = 'stage';
+CREATE VIEW agents AS
+  SELECT c.id AS card, n.value AS agent, k.value AS kind, c.summary AS does,
+    (SELECT group_concat(s.value, ' → ') FROM (SELECT value FROM fields WHERE card = c.id AND name = 'steps' ORDER BY n) s) AS steps,
+    (SELECT group_concat(m.value, ', ') FROM fields m WHERE m.card = c.id AND m.name = 'models') AS models
+  FROM cards c JOIN field n ON n.card = c.id AND n.name = 'name' LEFT JOIN field k ON k.card = c.id AND k.name = 'kind' WHERE c.type = 'agent';
+CREATE VIEW components AS
+  SELECT c.id AS card, n.value AS component, v.value AS version, w.value AS what, f.value AS file
+  FROM cards c JOIN field n ON n.card = c.id AND n.name = 'component' JOIN field v ON v.card = c.id AND v.name = 'version'
+  JOIN field w ON w.card = c.id AND w.name = 'what' JOIN field f ON f.card = c.id AND f.name = 'file' WHERE c.type = 'component';
+CREATE VIEW editor_commands AS
+  SELECT t.n AS n, t.value AS title, m.value AS command, k.value AS keys
+  FROM items t JOIN items m ON m.card = t.card AND m.list = 'commands' AND m.n = t.n AND m.field = 'command'
+  JOIN items k ON k.card = t.card AND k.list = 'commands' AND k.n = t.n AND k.field = 'keys' WHERE t.list = 'commands' AND t.field = 'title';
+CREATE VIEW editor_settings AS
+  SELECT s.value AS setting, d.value AS fallback, o.value AS does
+  FROM items s JOIN items d ON d.card = s.card AND d.list = 'settings' AND d.n = s.n AND d.field = 'default'
+  JOIN items o ON o.card = s.card AND o.list = 'settings' AND o.n = s.n AND o.field = 'does' WHERE s.list = 'settings' AND s.field = 'name';
+CREATE VIEW strategies AS
+  SELECT c.id AS card, substr(c.id, 10) AS strategy, f.value AS family, s.value AS scope, m.value AS mode, l.value AS lead, c.title AS title, c.summary AS does,
+    (SELECT group_concat(g.value, ', ') FROM fields g WHERE g.card = c.id AND g.name = 'stages') AS stages
+  FROM cards c LEFT JOIN field f ON f.card = c.id AND f.name = 'family' LEFT JOIN field s ON s.card = c.id AND s.name = 'scope'
+  LEFT JOIN field m ON m.card = c.id AND m.name = 'mode' LEFT JOIN field l ON l.card = c.id AND l.name = 'lead' WHERE c.type = 'strategy';
+CREATE VIEW capabilities AS
+  SELECT c.id AS card, c.type AS answer, a.value AS area, s.value AS status, c.title AS title, c.summary AS does,
+    (SELECT group_concat(p.platform, ', ') FROM platforms p WHERE p.card = c.id) AS platforms
+  FROM cards c LEFT JOIN field a ON a.card = c.id AND a.name = 'area' LEFT JOIN field s ON s.card = c.id AND s.name = 'status' WHERE c.shelf = 'capabilities';
+"""
+
+// A value as the tables keep it: a text as it is, true and false as words, a number as it is written.
+factText(value: any) string
+  if value is boolean
+    return value ? "true" : "false"
+  if value is any[]
+    values: any[] = value
+    return values.map((x) => factText(x)).join(", ")
+  value == null ? "" : "${value}"
+
+// The exact facts of the knowledge base, in a relational database (SQLite): what a question with one right answer
+// reads (every command of a tool, the parameters of an MCP tool, the commands that write a kind). The database lives
+// in the memory of the graph's process only, never on disk: it is made from the rows of the base (at the start, from
+// the cards the store keeps sealed; again at every ingest) and read with the queries of the base's own catalogue
+// (the `queries` shelf). It holds names, one-line summaries and structured fields: never a row's body, never what an
+// agent kept at run time.
+Facts
+  // The database, once it was filled; one reader at a time.
+  tables: any = null
+  turn: any = threading.Lock()
+
+  // Whether the tables were ever filled.
+  filled() boolean
+    tables != null
+
+  // Every value of a row's `meta` or `data` as the rows of `fields` and `items`.
+  static flatten(card: string, prefix: string, value: any, fields: any[], items: any[]) void
+    if isinstance(value, dict)
+      held: <string, any> = value
+      for name, inner in held
+        Facts.flatten(card, prefix.length > 0 ? "${prefix}.${name}" : name, inner, fields, items)
+    else if value is any[]
+      values: any[] = value
+      for n in 0..values.length
+        if isinstance(values[n], dict)
+          object: <string, any> = values[n]
+          for field, inner in object
+            items.add([card, prefix, n, field, factText(inner)])
+        else
+          fields.add([card, prefix, factText(values[n]), n])
+    else if value != null
+      fields.add([card, prefix, factText(value), 0])
+
+  // Makes the tables hold exactly the rows of the base (`byShelf`: shelf → its rows with where each comes from),
+  // at its revision. They are made aside and then take the place of the old ones: a reader sees the old facts or
+  // the new ones, never half.
+  fill(byShelf: <string, Loaded[]>, revision: int = 0) <string, int>
+    cards: any[] = []
+    platforms: any[] = []
+    keys: any[] = []
+    links: any[] = []
+    fields: any[] = []
+    items: any[] = []
+    for shelf, loaded in byShelf
+      for l in loaded
+        row: <string, any> = Assets.normal(l.row)
+        id = "${row["id"]}"
+        cards.add([id, shelf, "${row["type"]}", "${row["title"]}", "${row["summary"]}", row["agents"] == true ? 1 : 0, l.origin])
+        named: string[] = row["platforms"]!
+        if named.length == 0
+          named = ["all"]
+        for platform in named
+          platforms.add([id, platform])
+        own: string[] = row["keys"]!
+        for key in own.unique()
+          keys.add([id, key])
+        edges: <string, any>[] = row["links"]!
+        for link in edges
+          links.add([id, "${link["rel"]}", "${link["to"]}"])
+        Facts.flatten(id, "", row["meta"], fields, items)
+        Facts.flatten(id, "", row["data"], fields, items)
+    // the requests of the server run on threads of their own: the lock gives each its turn
+    db = sqlite3.connect(":memory:", checkSameThread = false)
+    db.executescript(SCHEMA_SQL)
+    db.executescript(VIEWS_SQL)
+    db.executemany("INSERT INTO cards VALUES (?, ?, ?, ?, ?, ?, ?)", cards)
+    db.executemany("INSERT INTO platforms VALUES (?, ?)", platforms)
+    db.executemany("INSERT INTO keys VALUES (?, ?)", keys)
+    db.executemany("INSERT INTO links VALUES (?, ?, ?)", links)
+    db.executemany("INSERT INTO fields VALUES (?, ?, ?, ?)", fields)
+    db.executemany("INSERT INTO items VALUES (?, ?, ?, ?, ?)", items)
+    db.execute("INSERT INTO about VALUES ('revision', ?)", ["${revision}"])
+    db.commit()
+    // from here on the database is only read: a query of the catalogue that tried to write would be refused
+    db.execute("PRAGMA query_only = ON")
+    turn.acquire()
+    try
+      old = tables
+      tables = db
+      if old != null
+        old.close()
+    finally
+      turn.release()
+    { "cards": cards.length, "keys": keys.length, "links": links.length, "fields": fields.length, "items": items.length }
+
+  // The rows a query gives, each as column → value. `params`: its named parameters (`:kind`), never text put inside
+  // the query; a parameter the query does not name is left out. The database is only read.
+  run(sql: string, params: <string, any>? = null) <string, any>[]
+    if tables == null
+      return []
+    given: <string, any> = params ?? {}
+    named: <string, any> = {}
+    for m in Regex(r"(?<![:\w]):([a-z_]+)").findAll(sql)
+      named[m[1] ?? ""] = given[m[1] ?? ""]
+    turn.acquire()
+    try
+      cursor = tables.execute(sql, named)
+      columns: string[] = []
+      for column in cursor.description
+        columns.add("${column[0]}")
+      out: <string, any>[] = []
+      for values in cursor.fetchall()
+        row: <string, any> = {}
+        for at in 0..columns.length
+          row[columns[at]] = values[at]
+        out.add(row)
+      out
+    finally
+      turn.release()
+
+  // The first two columns of every row a query gives, as texts: what people write and the value it means (the
+  // `values` of a query's parameter).
+  pairs(sql: string) string[][]
+    if tables == null
+      return []
+    turn.acquire()
+    try
+      out: string[][] = []
+      for values in tables.execute(sql).fetchall()
+        out.add(["${values[0]}", "${values[1]}"])
+      out
+    finally
+      turn.release()
+
+  // What is wrong with the catalogue of exact questions (the rows of the `queries` shelf): a query that the tables
+  // cannot run, a parameter it names and does not declare, a declared one it never uses. Checked against empty
+  // tables: the build fails before a broken query reaches the graph.
+  static problems(rows: <string, any>[]) string[]
+    out: string[] = []
+    db = sqlite3.connect(":memory:")
+    try
+      db.executescript(SCHEMA_SQL)
+      db.executescript(VIEWS_SQL)
+      for row in rows
+        data: <string, any> = Assets.mapOf(row["data"])
+        sql = "${data["sql"] ?? ""}"
+        id = "${row["id"]}"
+        if sql.trim().length == 0
+          out.add("queries/${id}: no `data.sql`")
+          continue
+        if not Regex(r"^\s*(SELECT|WITH)\b", ignoreCase = true).test(sql) or ";" in sql.trim().replaceAll(Regex(r";\s*$"), "")
+          out.add("queries/${id}: a query is one SELECT")
+          continue
+        declared: string[] = Assets.listOf(data["params"]).map((p) => "${p["name"]}")
+        used = Regex(r"(?<![:\w]):([a-z_]+)").findAll(sql).map((m) => m[1] ?? "").unique()
+        for name in used
+          if not (name in declared)
+            out.add("queries/${id}: the query names `:${name}`, which `data.params` does not declare")
+        for name in declared
+          if not (name in used)
+            out.add("queries/${id}: `data.params` declares `${name}`, which the query never names")
+        blank: <string, any> = {}
+        for name in used
+          blank[name] = ""
+        try
+          db.execute("EXPLAIN ${sql}", blank)
+        catch e
+          out.add("queries/${id}: the tables cannot run it (${e})")
+        params: <string, any>[] = Assets.listOf(data["params"])
+        for param in params
+          said = "${param["values"] ?? ""}"
+          if said.length > 0
+            try
+              columns: any[] = list(db.execute(said).description)
+              if columns.length < 2
+                out.add("queries/${id}: the values of `${param["name"]}` give two columns: what people write, and the value it means")
+            catch e
+              out.add("queries/${id}: the values of `${param["name"]}` cannot be read (${e})")
+      out
+    finally
+      db.close()

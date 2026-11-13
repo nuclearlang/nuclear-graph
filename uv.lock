@@ -1470,18 +1470,22 @@ wheels = [
 
 [[package]]
 name = "nuclear-graph"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
 ]
 
 [package.optional-dependencies]
+mcp = [
+    { name = "mcp" },
+]
 server = [
     { name = "chromadb" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "mcp" },
+    { name = "numpy" },
     { name = "ollama" },
     { name = "uvicorn" },
 ]
@@ -1495,12 +1499,14 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'server'", specifier = ">=44" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3" },
     { name = "mcp", marker = "extra == 'server'", specifier = ">=2.3" },
+    { name = "numpy", marker = "extra == 'server'", specifier = ">=2" },
     { name = "ollama", marker = "extra == 'server'", specifier = ">=0.6" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30" },
 ]
-provides-extras = ["server", "test"]
+provides-extras = ["mcp", "server", "test"]
 
 [[package]]
 name = "numpy"

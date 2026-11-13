@@ -1,0 +1,14 @@
+{
+  "dialect": "python",
+  "kinds": {},
+  "language": "python",
+  "name": "nuclear_graph",
+  "output": "build",
+  "platform": null,
+  "plugins": [],
+  "toolchain": {
+    "installed": null,
+    "serve": null,
+    "url": null
+  }
+}

@@ -1,0 +1,102 @@
+use hashlib
+use pathlib{ Path }
+
+BATCH = 64
+
+// Fills the shelves of the graph from the knowledge base folder (`nuclear-graph knowledge build` wrote it; ADR-0104),
+// its table of exact facts, and the `prompts` collection from this package's prompt files. Only what changed is
+// embedded again; a row the base no longer has is removed, and what an agent wrote at run time (`origin: runtime`)
+// is kept.
+Ingest
+  // The validated prompt of each use case (`prompts/<use_case>.md`) and of each agent step (`agents/<step>.md`:
+  // `agent.<step>`).
+  static prompts() <string, any>[]
+    out: <string, any>[] = []
+    folder = Paths.prompts()
+    cases: Path[] = list(folder.glob("*.md"))
+    steps: Path[] = list(folder.joinpath("agents").glob("*.md"))
+    names: string[] = []
+    files: Path[] = []
+    for path in cases.sorted()
+      names.add("${path.stem}")
+      files.add(path)
+    for path in steps.sorted()
+      if path.name != "README.md"
+        names.add("agent.${path.stem}")
+        files.add(path)
+    for at in 0..files.length
+      text: string = files[at].readText()
+      name = names[at]
+      out.add({ "id": "prompt-${name}", "document": text, "meta": { "source": "prompt:${name}", "kind": "prompt", "use_case": name, "title": name, "hash": hashlib.sha1(text.toBytes()).hexdigest() } })
+    out
+
+  // The rows of the base as the store holds them (each shelf's cards, read back from their sealed documents and
+  // their metadata): what the exact facts are made from when the graph starts. What an agent kept at run time is not
+  // a card, and is left out.
+  static stored(store: Store) <string, Loaded[]>
+    common = ["card", "facet", "type", "title", "agents", "platforms", "keys", "tags", "links", "origin", "source", "hash", "rev"]
+    out: <string, Loaded[]> = {}
+    for shelf in shelfTable().keys
+      rows: Loaded[] = []
+      for item in store.read(shelf, { "facet": "card" })
+        card = Assets.cardOf("${item["text"]}")
+        if card == null
+          continue
+        meta: <string, any> = item["meta"] ?? {}
+        own: <string, any> = {}
+        for key, value in meta
+          if not (key in common)
+            own[key] = value
+        named: string[] = meta["platforms"] ?? []
+        row: <string, any> = { ...card!, "body": "-", "keys": meta["keys"] ?? [], "platforms": named.filter((p) => p != "all"), "agents": meta["agents"] != false, "meta": own }
+        rows.add(Loaded(row, "${meta["origin"] ?? "curated"}"))
+      out[shelf] = rows
+    out
+
+  // Makes a collection hold exactly `items` (and the ids of `keep`), embedding only the ones whose hash changed.
+  static sync(store: Store, collection: string, items: <string, any>[], keep: string[], log: (line: string) => void) <string, int>
+    old: <string, string> = store.hashes(collection)
+    ids = items.map((i) => "${i["id"]}")
+    fresh = items.filter((i) => old["${i["id"]}"] != i["meta"]!["hash"])
+    gone = old.keys.filter((i) => not (i in ids) and not (i in keep))
+    at = 0
+    while at < fresh.length
+      store.put(collection, fresh.slice(at, at + BATCH))
+      log("  ${collection}: ${Math.min(at + BATCH, fresh.length)} of ${fresh.length}")
+      at += BATCH
+    store.delete(collection, gone)
+    { "added": fresh.length, "kept": items.length - fresh.length, "removed": gone.length }
+
+  // The knowledge base folder `root` becomes what the graph knows: its shelves, and with `facts` its exact facts,
+  // made again whole. An invalid base is refused whole: the graph never holds half of a revision.
+  static ingest(store: Store, folder: Path, log: (line: string) => void, facts: Facts? = null) <string, any>
+    root: Path = folder.resolve()
+    if not root.joinpath("manifest.json").isFile() or not root.joinpath("assets").isDir()
+      throw ValueError("${root} is not a knowledge base (no manifest.json and assets/): build it with `nuclear-graph knowledge build`")
+    manifest = Knowledge.readManifest(root)
+    recorded: <string, any> = manifest["rows"]!
+    loaded: <string, Loaded[]> = Assets.load(root)
+    byShelf: <string, <string, any>[]> = {}
+    for shelf, rows in loaded
+      byShelf[shelf] = rows.map((l) => l.row)
+    problems: string[] = [...Assets.problems(byShelf), ...Facts.problems(byShelf[exactShelf()] ?? [])]
+    if problems.length > 0
+      throw ValueError("the knowledge base is not valid:\n${problems.take(20).join("\n")}")
+    result: <string, any> = {}
+    for shelf in shelfTable().keys
+      items: <string, any>[] = []
+      held: Loaded[] = loaded[shelf] ?? []
+      for l in held
+        entry: any[] = recorded["${l.row["id"]}"] ?? [0, 0, 0]
+        items.addAll(Assets.facets(l.row, shelf, l.origin, entry[2]))
+      runtime = store.where(shelf, { "origin": "runtime" }).map((i) => "${i["id"]}")
+      result[shelf] = Ingest.sync(store, shelf, items, runtime, log)
+    result["prompts"] = Ingest.sync(store, "prompts", Ingest.prompts(), [], log)
+    store.setVersion(manifest["schema"]!, manifest["revision"]!)
+    gone: string[] = store.dropLegacy()
+    if gone.length > 0
+      log("  removed the collections of before the shelves: ${gone.join(", ")}")
+    if facts != null
+      result["facts"] = facts!.fill(loaded, manifest["revision"]!)
+    result["version"] = store.version()
+    result

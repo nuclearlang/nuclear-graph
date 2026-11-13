@@ -1,0 +1,17 @@
+use os
+use base64
+use cryptography/hazmat/primitives/ciphers/aead{ AESGCM }
+
+// Documents are stored encrypted (AES-256-GCM); only the graph's process, which holds the key, reads them.
+Box(key: Bytes)
+  aes: any = AESGCM(key)
+
+  seal(text: string) string
+    nonce = os.urandom(12)
+    sealed: Bytes = nonce + aes.encrypt(nonce, text.toBytes(), null)
+    sealed.toBase64()
+
+  open(sealed: string) string
+    raw = Bytes.fromBase64(sealed)
+    opened: Bytes = aes.decrypt(raw.slice(0, 12), raw.slice(12), null)
+    opened.toText()

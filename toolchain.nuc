@@ -1,0 +1,182 @@
+use asyncio
+use codecs
+use shutil
+use tempfile
+use pathlib{ Path }
+
+PLATFORM_NAMES = ["backend", "mobile", "web"]
+
+// What a command gave: its exit code and what it printed.
+Ran(code: int, out: string)
+
+// Runs a command and waits for it, at most `timeout` seconds.
+runTool(args: string[], cwd: string? = null, timeout: int = 300) Ran
+  if shutil.which(args[0]) == null
+    return Ran(127, "${args[0]} is not installed (run the NuclearLang installer)")
+  p = ~asyncio.createSubprocessExec(...args, cwd = cwd, stdout = asyncio.subprocess.PIPE, stderr = asyncio.subprocess.STDOUT)
+  try
+    done = ~asyncio.waitFor(p.communicate(), timeout)
+    Ran(p.returncode ?? 0, codecs.decode(done[0], "utf-8", "replace"))
+  catch e
+    if not isinstance(e, TimeoutError)
+      throw e
+    p.kill()
+    Ran(124, "${args.join(" ")}: timed out after ${timeout} s")
+
+// Every JSON array `nuclear check --json` printed (one per file group), joined; null if there is none.
+diagnosticsOf(out: string) <string, any>[]?
+  decoder = json.JSONDecoder()
+  found: <string, any>[] = []
+  seen = false
+  at = out.indexOf("[")
+  while at != -1
+    try
+      pair = decoder.rawDecode(out, at)
+      if isinstance(pair[0], list)
+        values: any[] = pair[0]
+        found.addAll(values.filter((v) => isinstance(v, dict)))
+        seen = true
+      at = bracketFrom(out, pair[1])
+    catch e
+      at = bracketFrom(out, at + 1)
+  seen ? found : null
+
+// Where the next `[` of a text is, from `start` on (-1 when there is none).
+bracketFrom(text: string, start: int) int
+  found = text.substring(start).indexOf("[")
+  found < 0 ? -1 : start + found
+
+// `line:col CODE message (fix: ...)`, one per error; `ok` when there are none.
+describe(diagnostics: <string, any>[]) string
+  lines: string[] = []
+  for d in diagnostics
+    if d["severity"] != "error"
+      continue
+    fix = d["fix"] != null and d["fix"] != "" ? " (fix: ${d["fix"]})" : ""
+    where = d["file"] != null and d["file"] != "" ? "${d["file"]}:" : ""
+    lines.add("${where}${d["line"]}:${d["col"]} ${d["code"]} ${d["message"]}${fix}")
+  lines.length > 0 ? lines.join("\n") : "ok"
+
+// The code inside a model's ```nuclear block (or the text as it is).
+stripFences(code: string) string
+  if not ("```" in code)
+    return "${code.trim()}\n"
+  inside = false
+  block: string[] = []
+  out: string[] = []
+  for line in linesOf(code)
+    if line.trim().startsWith("```")
+      if inside
+        out.add(block.join("\n"))
+        block = []
+      inside = not inside
+      continue
+    if inside
+      block.add(line)
+  "${(out.length > 0 ? out.join("\n\n") : code).trim()}\n"
+
+// `BooksOfAuthor` → `books_of_author`, `HTTPClient` → `http_client` (a file name).
+snake(name: string) string
+  out: string[] = []
+  chars = name.chars()
+  digit = Regex(r"\d")
+  for i in 0..chars.length
+    c = chars[i]
+    if c != c.lower() and i > 0
+      prev = chars[i - 1]
+      nextLower = i + 1 < chars.length and chars[i + 1] != chars[i + 1].upper()
+      if prev != prev.upper() or digit.test(prev) or (nextLower and prev != prev.lower())
+        out.add("_")
+    out.add(c.lower())
+  out.join("")
+
+// The path of a declaration's file by the platform's layout; "" for a kind the layout does not know.
+layoutPath(layout: <string, string>, kind: string, name: string, component: string, screen: string = "") string
+  template = layout[kind] ?? ""
+  if template.length == 0
+    return ""
+  folder: string = snake(component)
+  view: string = snake(screen)
+  template.replaceAll("{component}", folder.length > 0 ? folder : "app").replaceAll("{screen}", view.length > 0 ? view : "widgets").replaceAll("{file}", snake(name))
+
+// `--platform backend` for a platform (what an agent that writes only Nuclear names), `--dialect fastapi` else.
+target(name: string) string[]
+  name in PLATFORM_NAMES ? ["--platform", name] : ["--dialect", name]
+
+// The NuclearLang command line tools, for agents: check, build and format a piece of Nuclear, and run the Dragonfly
+// commands of a project. Answers are short texts a small model can read.
+Toolchain
+  // The errors of a piece of Nuclear (`ok` when it has none).
+  check(code: string, platform: string = "backend") string
+    folder = tempfile.mkdtemp()
+    try
+      file = Path(folder).joinpath("piece.nuc")
+      file.writeText(stripFences(code))
+      ran = ~runTool(["nuclear", "check", "${file}", ...target(platform), "--json"])
+      found = diagnosticsOf(ran.out)
+      if found == null
+        return ran.out.trim()
+      // the piece is checked in a scratch file: its errors are told by line, never by that file's path
+      describe(found!.map((d) => { ...d, "file": "" }))
+    finally
+      shutil.rmtree(folder, ignoreErrors = true)
+
+  // The code a piece of Nuclear becomes (with a platform, in its default dialect's language).
+  build(code: string, platform: string = "backend") string
+    folder = tempfile.mkdtemp()
+    try
+      file = Path(folder).joinpath("piece.nuc")
+      file.writeText(stripFences(code))
+      ran = ~runTool(["nuclear", "build", "${file}", ...target(platform)])
+      ran.out
+    finally
+      shutil.rmtree(folder, ignoreErrors = true)
+
+  // The errors of every file of a project.
+  checkProject(root: string) string
+    ran = ~runTool(["nuclear", "check", root, "--json"])
+    found = diagnosticsOf(ran.out)
+    if found == null
+      return ran.code == 0 ? "ok" : ran.out.trim()
+    describe(found!)
+
+  fmt(code: string) string
+    folder = tempfile.mkdtemp()
+    try
+      file = Path(folder).joinpath("piece.nuc")
+      file.writeText(stripFences(code))
+      ~runTool(["nuclear", "fmt", "${file}"])
+      file.readText()
+    finally
+      shutil.rmtree(folder, ignoreErrors = true)
+
+  // `nuclear help <word> [--platform p | --dialect d]`: a kind, decorator, topic or command.
+  help(word: string, platform: string = "") string
+    named: string[] = platform.length > 0 ? target(platform) : []
+    ran = ~runTool(["nuclear", "help", word, ...named])
+    ran.out
+
+  // Where each kind's file goes in a project of the platform (`nuclear help layout`): kind → path.
+  layout(platform: string = "backend") <string, string>
+    ran = ~runTool(["nuclear", "help", "layout", ...target(platform)])
+    found: <string, string> = {}
+    for line in linesOf(ran.out)
+      columns = line.trim().split(Regex(r"\s+"))
+      if columns.length == 2 and columns[1].endsWith(".nuc")
+        found[columns[0]] = columns[1]
+    found
+
+  // The path of one declaration's file in a project of the platform ("" for an unknown kind).
+  pathOf(platform: string, kind: string, name: string, component: string, screen: string = "") string
+    layoutPath(~layout(platform), kind, name, component, screen)
+
+  // The short sheet: with a platform, Nuclear and the platform only (what a local agent reads); with a dialect, also
+  // the dialect and its language.
+  brief(platform: string = "backend") string
+    ran = ~runTool(["nuclear", "spec", "--brief", ...target(platform)])
+    ran.out
+
+  // A `dragonfly` command in a project (build, test, check, make, migrate...): its exit code and output.
+  dragonfly(root: string, args: string[], timeout: int = 900) string
+    ran = ~runTool(["dragonfly", ...args], cwd = root, timeout = timeout)
+    "exit ${ran.code}\n${ran.out.substring(Math.max(0, ran.out.length - 6000))}"

@@ -1,0 +1,121 @@
+use pathlib{ Path }
+
+// Who may read the graph, what it keeps at rest, and how it is searched.
+
+testNothingWithoutATokenAndNoBrowsers(tmpPath: Path) void
+  http = Testing.http(tmpPath, Testing.store(tmpPath))
+  expect(http.get("/v1/health").json()["status"] == "ok")
+  expect(http.get("/v1/stats").statusCode == 401)
+  expect(http.get("/v1/stats", headers = Testing.auth("not-a-token")).statusCode == 401)
+  expect(http.get("/v1/stats", headers = Testing.auth()).json()["client"] == "owner")
+  expect(http.get("/v1/health", headers = { "Origin": "http://evil.example" }).statusCode == 403)
+
+testAProgramGetsAccessOnlyWhenTheUserAllowsIt(tmpPath: Path) void
+  http = Testing.http(tmpPath, Testing.store(tmpPath))
+  asked = http.post("/v1/access", json = { "client": "editor", "scopes": ["read"], "reason": "the chat" }).json()["request"]
+  expect(http.get("/v1/access/${asked}").json()["status"] == "pending")
+  expect(http.post("/v1/access/${asked}/allow").statusCode == 401)
+  expect(http.post("/v1/access", json = { "client": "x", "scopes": ["admin"] }).statusCode == 400)
+  http.post("/v1/access/${asked}/allow", headers = Testing.auth())
+  given = http.get("/v1/access/${asked}").json()
+  token = "${given["token"]}"
+  expect(given["status"] == "allowed" and token.startsWith("ng_"))
+  // the token is handed once, and kept only as a hash
+  expect(not ("token" in http.get("/v1/access/${asked}").json()))
+  grants: string = tmpPath.joinpath("grants.json").readText()
+  expect(not (token in grants))
+  expect(http.get("/v1/stats", headers = Testing.auth(token)).json()["client"] == "editor")
+  expect(http.post("/v1/ingest", json = { "roots": ["x"] }, headers = Testing.auth(token)).statusCode == 403)
+  expect(http.post("/v1/documents", json = { "id": "n", "text": "t" }, headers = Testing.auth(token)).statusCode == 403)
+
+testDocumentsAreEncryptedAtRestAndFoundByMeaning(tmpPath: Path) void
+  store = Testing.store(tmpPath)
+  http = Testing.http(tmpPath, store)
+  secret = "the invoices table holds zanzibar-quetzal"
+  expect(http.post("/v1/documents", json = { "collection": "memory", "id": "note-1", "text": secret, "meta": { "project": "shop" } }, headers = Testing.auth()).statusCode == 200)
+  found: <string, any>[] = http.post("/v1/search", json = { "query": "invoices table", "collection": "memory" }, headers = Testing.auth()).json()["items"]
+  expect(found[0]["id"] == "note-1" and found[0]["text"] == secret)
+  for file in tmpPath.joinpath("db").rglob("*")
+    if file.isFile()
+      raw: Bytes = file.readBytes()
+      expect(not ("zanzibar-quetzal".toBytes() in raw))
+
+testAnAgentWritesOnlyMemoryAndExamples(tmpPath: Path) void
+  store = Testing.store(tmpPath)
+  access = Access(tmpPath.joinpath("grants.json"))
+  http = Testing.http(tmpPath, store)
+  token = access.grant("agent", ["read", "write"])
+  lie = { "collection": "errors", "id": "error:N0114", "text": "false documentation" }
+  expect(http.post("/v1/documents", json = lie, headers = Testing.auth(token)).statusCode == 403)
+  note = { "collection": "memory", "id": "m1", "text": "the project keeps lies out", "meta": { "kind": "note" } }
+  expect(http.post("/v1/documents", json = note, headers = Testing.auth(token)).statusCode == 200)
+  kept: <string, any>[] = http.post("/v1/search", json = { "query": "lies", "collection": "memory", "agents": true }, headers = Testing.auth(token)).json()["items"]
+  expect(kept[0]["meta"]["origin"] == "runtime" and kept[0]["meta"]["by"] == "agent")
+  expect(http.delete("/v1/documents/errors/error:N0114", headers = Testing.auth(token)).statusCode == 403)
+
+testARowIsFoundByTheExactNameItCarriesAndReadByItsId(tmpPath: Path) void
+  store = Testing.store(tmpPath)
+  http = Testing.http(tmpPath, store)
+  Testing.shelve(store, "errors", [
+    Testing.row("error:N0114", { "title": "not a member of the library", "summary": "A name of another language.", "keys": ["n0114"], "links": [{ "rel": "see", "to": "error:N0011" }] }),
+    Testing.row("error:N0011", { "title": "invalid escape sequence", "summary": "A backslash before a letter that is no escape.", "keys": ["n0011"] }),
+  ])
+  got: <string, any>[] = http.post("/v1/search", json = { "query": "what does N0114 mean", "collection": "errors" }, headers = Testing.auth()).json()["items"]
+  expect(got[0]["id"] == "error:N0114" and got[0]["via"] == "key")
+  expect(got[0]["card"]["summary"] == "A name of another language." and "${got[0]["text"]}".startsWith("[errors/diagnostic]"))
+  // the search is exact: every item is measured on the vector the store keeps of it, the closest first
+  vector = store.embedQuery("what does N0114 mean")
+  searched: <string, any>[] = store.near("errors", vector, 5)
+  measured: <string, any>[] = store.measure("errors", vector, ["error:N0114", "error:N0011", "error:N9999"])
+  expect(searched.length == 2 and searched[0]["distance"] <= searched[1]["distance"] and measured == searched)
+  expect(store.near("errors", vector, 1) == [searched[0]] and store.near("errors", vector, 5, { "card": "error:N0011" })[0]["id"] == "error:N0011")
+  one = http.get("/v1/cards/error:N0114", headers = Testing.auth()).json()
+  expect(one["id"] == "error:N0114" and one["related"][0]["id"] == "error:N0011")
+  expect(http.get("/v1/cards/error:N9999", headers = Testing.auth()).statusCode == 404)
+
+testAQuestionFindsTheCardThatAnswersItOnce(tmpPath: Path) void
+  store = Testing.store(tmpPath)
+  http = Testing.http(tmpPath, store)
+  Testing.shelve(store, "concepts", [
+    Testing.row("concept:mcp", { "type": "concept", "summary": "The protocol an AI client speaks.", "asks": ["how does the mcp work", "what is the mcp"] }),
+    Testing.row("concept:serve", { "type": "concept", "summary": "Runs the server." }),
+  ])
+  got: <string, any>[] = http.post("/v1/search", json = { "query": "how does the mcp work" }, headers = Testing.auth()).json()["items"]
+  expect(got[0]["id"] == "concept:mcp" and got[0]["via"] == "ask" and got[0]["distance"] < 0.01)
+  expect(got.count((item) => item["id"] == "concept:mcp") == 1)
+
+testALocalAgentReadsOnlyItsRowsAndItsPlatform(tmpPath: Path) void
+  store = Testing.store(tmpPath)
+  Testing.shelve(store, "platforms", [
+    Testing.row("kind:backend.usecase", { "type": "kind", "summary": "One business operation of a backend.", "platforms": ["backend"], "keys": ["usecase", "use case"], "meta": { "kind": "usecase" } }),
+    Testing.row("kind:mobile.usecase", { "type": "kind", "summary": "One business operation of an app.", "platforms": ["mobile"], "keys": ["usecase"], "meta": { "kind": "usecase" } }),
+    Testing.row("spec:python", { "type": "spec", "summary": "What a use case becomes in Python.", "agents": false }),
+  ])
+  mine = Retrieve.search(store, "use case", ["platforms"], platform = "backend", agents = true)
+  expect(mine.map((item) => "${item["id"]}") == ["kind:backend.usecase"])
+  all: <string, any>[] = Retrieve.search(store, "use case", ["platforms"])
+  expect(all.length == 3)
+  // how people write a kind, for a planner
+  spoken = Testing.http(tmpPath, store).get("/v1/kinds/backend", headers = Testing.auth()).json()
+  expect(spoken == { "usecase": "usecase", "use case": "usecase" })
+
+testARequestGetsTheStrategyOfItsKindAndASpecItsLimits(tmpPath: Path) void
+  store = Testing.store(tmpPath)
+  Testing.shelve(store, "playbooks", [
+    Testing.row("strategy:refactor-rename", { "type": "strategy", "title": "Strategy: a rename", "summary": "A tool rewrites every file that writes the name.", "meta": { "family": "change", "triggers": ["rename", "renombra"] }, "data": { "signals": ["\\brenombra\\s+\\w+\\s+a\\s+\\w+"], "target": "existing", "stages": ["code", "verify"], "mode": "write", "pieces": "naming" } }),
+    Testing.row("strategy:question", { "type": "strategy", "title": "Strategy: a question", "summary": "It is answered, nothing is run.", "meta": { "family": "beyond", "triggers": ["what is", "que es"] }, "data": { "mode": "answer" } }),
+    Testing.row("strategy:resource-db", { "type": "strategy", "title": "Strategy: a stored resource", "summary": "One generator call writes it.", "meta": { "family": "create", "triggers": ["crud"] }, "data": { "target": "new", "stages": ["generate", "plan", "code"], "generators": ["resource"] } }),
+  ])
+  Testing.shelve(store, "capabilities", [
+    Testing.row("limit:backend-not-yet", { "type": "limit", "title": "Limit: no guards yet", "summary": "Access control is written by hand.", "platforms": ["backend"], "meta": { "triggers": ["guard", "session"] } }),
+  ])
+  best = Retrieve.strategy(store, "renombra Book a Title", "backend", ["Book"], [])
+  expect(best[0]["id"] == "strategy:refactor-rename" and "it writes \"renombra Book a Title\"" in "${best[0]["why"]}" and "Book: the project has it" in "${best[0]["why"]}")
+  expect(Retrieve.strategy(store, "un crud de pedidos", "backend", [], ["Order", "NewOrder"])[0]["id"] == "strategy:resource-db")
+  // a run of the Loop is not given a strategy without stages unless an exact sign chose it; a named one comes first
+  expect(Retrieve.strategy(store, "que es un caso de uso", runnable = true)[0]["id"] != "strategy:question")
+  expect(Retrieve.strategy(store, "anything at all", only = "question")[0]["id"] == "strategy:question")
+  told: <string, any>[] = Retrieve.applies(store, "An api with guards on every route", "backend")
+  expect(told.length == 1 and told[0]["id"] == "limit:backend-not-yet" and told[0]["trigger"] == "guard")
+  elsewhere: <string, any>[] = Retrieve.applies(store, "An api with guards", "mobile")
+  expect(elsewhere.length == 0)

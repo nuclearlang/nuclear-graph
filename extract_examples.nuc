@@ -1,0 +1,132 @@
+use tomllib
+use pathlib{ Path }
+
+// The rows of the examples shelf: the example projects and the solved tasks.
+ExtractExamples
+  // The first declaration of a file: [its kind word ("" when it has none), its name, where it starts]; [] for none.
+  static declared(code: string) any[]
+    m = Regex(r"^(?:([a-z][A-Za-z]*)\s+)?([A-Z][A-Za-z0-9]*)", multiline = true).find(code)
+    m == null ? [] : [m![1] ?? "", m![2] ?? "", m!.start]
+
+  // The kinds whose place in the platform's layout a file is at.
+  static layoutKinds(layout: <string, any>, rel: string) string[]
+    found: string[] = []
+    for kind, template in layout
+      escaped: string = re.escape("${template}")
+      pattern = escaped.replaceAll("\\{component\\}", "[^/]+").replaceAll("\\{screen\\}", "[^/]+").replaceAll("\\{file\\}", "[^/]+")
+      if Regex("^(?:${pattern})$").test(rel)
+        found.add(kind)
+    found
+
+  // The `//` lines right above the declaration at `at` (its decorators are skipped).
+  static docComment(text: string, at: int) string
+    lines = linesOf(text.substring(0, at))
+    while lines.length > 0 and lines.last.startsWith("@")
+      lines.removeLast()
+    doc: string[] = []
+    while lines.length > 0 and lines.last.startsWith("//")
+      doc.insert(0, lines.removeLast().replaceAll(Regex(r"^[/ ]+"), "").replaceAll(Regex(r"^[* ]+"), "").trim())
+    doc.join(" ")
+
+  static projects(ctx: Context) <string, any>[]
+    layouts: <string, <string, any>> = {}
+    kinds: <string, string[]> = {}
+    for p in platformNames()
+      contract = ExtractPlatforms.filesOf(ctx, p).contract
+      layouts[p] = tableAt(contract, "layout")
+      kinds[p] = listAt(tableAt(contract, "platform"), "kinds")
+    rows: <string, any>[] = []
+    roots: Path[] = []
+    for path in walk(ctx.tree)
+      parts: string[] = list(path.relativeTo(ctx.tree).parts)
+      if path.name == "config.nuc" and not ("data" in parts)
+        roots.add(path.parent)
+    roots.sort()
+    roots.add(ctx.tree.joinpath("examples/projects/greetings"))
+    for root in roots
+      if not root.isDir()
+        continue
+      manifest = root.joinpath("config.nuc")
+      config: string = manifest.isFile() ? manifest.readText() : ""
+      plat: string = captured(r'platform\s*=\s*"(\w+)"', config)
+      project: string = root.name
+      own: string[] = kinds[plat] ?? []
+      for path in walk(root)
+        rel: string = path.relativeTo(root).asPosix()
+        folders = rel.split("/")
+        folders.removeLast()
+        if path.suffix != ".nuc" or "data" in folders
+          continue
+        code: string = path.readText(errors = "replace")
+        code = code.trim()
+        first: any[] = ExtractExamples.declared(code)
+        word: string = first.length > 0 ? first[0] : ""
+        name: string = first.length > 0 ? first[1] : path.stem
+        byPath: string[] = ExtractExamples.layoutKinds(layouts[plat] ?? {}, rel)
+        kind = word in own ? word : (byPath.length > 0 ? byPath[0] : (word.length > 0 ? word : (path.name == "config.nuc" ? "config" : "file")))
+        doc = first.length > 0 ? ExtractExamples.docComment(code, first[2]) : ""
+        shown = code
+        if code.length > 5000
+          head = code.substring(0, 5000)
+          shown = "${head.substring(0, head.lastIndexOf("\n"))}\n// ... (the file goes on)"
+        summary: string = clip(doc, 400)
+        fallback = "A `${kind}` of the example project `${project}`${plat.length > 0 ? ", a ${plat} project." : "."}"
+        rows.add({
+          "id": "example:${project}/${rel.substring(0, rel.length - 4)}", "type": "file",
+          "title": clip("`${kind}` ${name} — the example project ${project}${plat.length > 0 ? " (${plat})" : ""}", 140),
+          "summary": summary.length > 0 ? summary : fallback,
+          "body": "`${rel}` of `${project}`:\n\n```nuclear\n${shown}\n```", "platforms": plat in platformNames() ? [plat] : [],
+          "sources": [path.relativeTo(ctx.tree).asPosix()], "meta": { "kind": kind, "name": name, "project": project },
+        })
+    programs: Path[] = list(ctx.tree.joinpath("examples/stdlib").glob("*.nuc"))
+    for path in programs.sorted()
+      program: string = path.readText()
+      program = program.trim()
+      doc = linesOf(program).take(6).filter((line) => line.startsWith("//")).map((line) => line.replaceAll(Regex(r"^[/ ]+"), "").trim()).join(" ")
+      stem: string = path.stem
+      brief: string = clip(doc, 400)
+      rows.add({
+        "id": "example:stdlib/${stem}", "type": "file", "title": "The standard library at work: ${stem} (a program that runs in every dialect)",
+        "summary": brief.length > 0 ? brief : "A runnable example of the standard library: ${stem}.",
+        "body": "`examples/stdlib/${path.name}`:\n\n```nuclear\n${program.substring(0, Math.min(5000, program.length))}\n```", "keys": ["${stem} example"],
+        "sources": ["examples/stdlib/${path.name}"], "meta": { "kind": "program", "name": stem, "project": "stdlib" },
+      })
+    rows
+
+  static solvedRow(rid: string, task: string, path: string, kind: string, code: string, plat: string) <string, any>
+    {
+      "id": "solved:${rid}", "type": "solved", "title": clip("Solved — a ${kind}: ${task}", 140), "summary": clip(task, 400),
+      "body": "Task: ${task}\n\nFile `${path}`:\n\n```nuclear\n${code.trim()}\n```", "platforms": plat in platformNames() ? [plat] : [],
+      "sources": ["nuclear-developer/eval/tasks.toml", "nuclear-developer/eval/results/reference.json"], "meta": { "kind": kind, "validated": "sonnet + nuclear check" },
+    }
+
+  // The answers of a frontier model to the evaluation's `train` tasks that pass the compiler and their acceptance
+  // texts (the distillation). The `test` tasks are held out: their answers never reach the graph.
+  static solved(ctx: Context) <string, any>[]
+    raw = ctx.read("nuclear-developer/eval/tasks.toml")
+    answers = ctx.read("nuclear-developer/eval/results/reference.json")
+    if raw.length == 0 or answers.length == 0
+      return []
+    bank: <string, any> = tomllib.loads(raw)
+    refs: <string, any> = json.loads(answers)
+    rows: <string, any>[] = []
+    for t in listAt(bank, "task")
+      r = refs[textAt(t, "id")]
+      if textAt(t, "split") == "train" and r != null and r.get("pass")
+        dialect: string = platformOfDialect(textAt(t, "dialect"))
+        rows.add(ExtractExamples.solvedRow(textAt(t, "id"), textAt(t, "task"), textAt(t, "path"), textAt(t, "kind"), "${r["code"]}", dialect.length > 0 ? dialect : textAt(t, "platform")))
+    names = Regex(r"^(?:([a-z][A-Za-z]*)\s+)?([A-Z][A-Za-z0-9]*)", multiline = true)
+    for f in listAt(bank, "feature")
+      r = refs[textAt(f, "id")]
+      if textAt(f, "split") != "train" or r == null or not r.get("pass")
+        continue
+      spec: string = textAt(f, "spec")
+      // one example per file, as the coder writes them
+      for path, code in tableAt(r, "files")
+        text = "${code}"
+        open = linesOf(text).filter((ln) => ln.trim().length > 0 and not ln.startsWith("//") and not ln.startsWith("@") and not ln.startsWith(" "))
+        first = open.length > 0 ? squeeze(open[0]).split(" ")[0] : "file"
+        declares = names.findAll(text).map((m) => m[2] ?? "")
+        said = spec.split(". ").filter((x) => declares.any((n) => Regex("\\b${n}\\b").test(x))).join(". ")
+        rows.add(ExtractExamples.solvedRow("${f["id"]}/${slug(path)}", said.length > 0 ? said : spec, path, first, text, textAt(f, "platform")))
+    rows

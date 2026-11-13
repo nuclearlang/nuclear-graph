@@ -1,0 +1,301 @@
+use asyncio
+use inspect
+use pathlib{ Path }
+use fastapi{ FastAPI, HTTPException, Request }
+use fastapi/responses{ JSONResponse }
+use pydantic{ BaseModel, Field }
+
+// `collection`: one collection, or "" for every shelf of the knowledge base; `shelves`: several shelves (instead of
+// `collection`); `platform`: backend, mobile or web (the rows of that platform and the ones of every platform);
+// `agents`: only what a local agent may read (Nuclear only); `where`: more filters by metadata ({"type": "kind"},
+// {"kind": "usecase"}, {"code": "N0114"}); `expand`: each card comes with the title and summary of the rows it links to.
+SearchIn: BaseModel
+  query: string = Field(minLength = 1, maxLength = 4000)
+  collection: string = ""
+  shelves: string[]? = null
+  k: int = Field(5, ge = 1, le = 30)
+  platform: string = ""
+  agents: boolean = false
+  where: <string, any>? = null
+  expand: boolean = false
+
+AppliesIn: BaseModel
+  text: string = Field(minLength = 1, maxLength = 40000)
+  platform: string = ""
+
+// `existing` and `new`: the declarations the request names that the project has, and the ones it has not (null: no
+// project was read); `runnable`: the caller is a run of the Loop (a strategy without stages comes first only when an
+// exact sign chose it); `only`: the strategy the request itself names, when it names one.
+StrategyIn: BaseModel
+  text: string = Field(minLength = 1, maxLength = 40000)
+  platform: string = ""
+  existing: string[]? = null
+  new: string[]? = null
+  runnable: boolean = false
+  only: string = ""
+
+PutIn: BaseModel
+  collection: string = "memory"
+  id: string = Field(minLength = 1, maxLength = 200)
+  text: string = Field(minLength = 1, maxLength = 40000)
+  meta: <string, any> = {}
+
+AccessIn: BaseModel
+  client: string
+  scopes: string[] = ["read"]
+  reason: string = ""
+
+IngestIn: BaseModel
+  roots: string[] = []
+
+// `platform`: the project's (backend, mobile or web); `history`: the conversation so far, as `you: ...` and
+// `agent: ...` lines, read for the names a follow-up leaves out; `agents`: only what a local agent may read; `k`: how
+// many cards the shelves give.
+AnswerIn: BaseModel
+  question: string = Field(minLength = 1, maxLength = 4000)
+  platform: string = ""
+  history: string = ""
+  agents: boolean = true
+  k: int = Field(4, ge = 1, le = 12)
+
+// One route of the HTTP API: its verb, its path, the scope a token needs for it ("" when it needs none) and the
+// method that answers it (its comment is the route's documentation).
+Route(verb: string, path: string, scope: string, handler: any)
+
+// The graph's HTTP API, on 127.0.0.1 only. Every route but `/v1/health` and the access request needs a token;
+// requests from a browser (with an `Origin` header) are refused, so a web page cannot reach it.
+Api
+  held: Store?
+  access: Access
+  owner: string
+  known: Facts
+  lock: any = asyncio.Lock()
+
+  // `store`: opened at the first request that needs it when left out; `grants`: who may use the graph (the grants
+  // of the data folder when left out); `ownerToken`: the owner's token (the keyring's when null); `exact`: the exact
+  // facts (made from what the store holds, at the first question, when left out).
+  (store: Store? = null, grants: Access? = null, ownerToken: string? = null, exact: Facts? = null)
+    held = store
+    access = grants ?? Access()
+    owner = ownerToken ?? Secrets.ownerToken()
+    known = exact ?? Facts()
+
+  db() Store
+    if held == null
+      held = Store()
+    held!
+
+  // The exact facts: made from the cards the store holds the first time they are asked for (a graph that starts).
+  facts() Facts
+    if not known.filled()
+      opened = db()
+      known.fill(Ingest.stored(opened), opened.version()["revision"] ?? 0)
+    known
+
+  // A request with an `Origin` header comes from a browser: refused.
+  noBrowsers(request: Request, callNext: any) any
+    origin: string = request.headers.get("origin") ?? ""
+    if origin.length > 0
+      return JSONResponse({ "detail": "browsers cannot use the graph" }, statusCode = 403)
+    ~callNext(request)
+
+  // The client of a request: its token is one the user allowed (401 otherwise) and has the scope (403 otherwise).
+  allowed(request: Request, scope: string) string
+    auth: string = request.headers.get("authorization") ?? ""
+    token = (auth.startsWith("Bearer ") ? auth.substring(7) : auth).trim()
+    who = token.length > 0 ? access.who(token, owner) : null
+    if who == null
+      throw HTTPException(401, "a token is needed: ask for access (POST /v1/access) and let the user allow it")
+    if not (scope in who!.scopes)
+      throw HTTPException(403, "client '${who!.name}' has no '${scope}' scope")
+    who!.name
+
+  // Whether the graph is running, and its version. Needs no token.
+  health() <string, string>
+    { "status": "ok", "version": graphVersion() }
+
+  // Searches the graph by meaning and by exact name: `{query, collection | shelves, k, platform, agents, where,
+  // expand}` answers `{items: [{id, shelf, text, meta, distance, score, via, card, related}]}`. Without a collection
+  // it searches every shelf of the knowledge base.
+  search(body: SearchIn, request: Request) <string, any>
+    allowed(request, "read")
+    among: string[] = body.shelves ?? (body.collection.length > 0 ? [body.collection] : searchedShelves())
+    unknown = among.filter((s) => not (s in collections()))
+    if unknown.length > 0
+      throw HTTPException(404, "unknown collection ${unknown} (collections: ${collections().join(", ")})")
+    items = ~asyncio.toThread(Retrieve.search, db(), body.query, among, body.k, body.platform, body.agents, body.where, body.expand)
+    { "items": items }
+
+  // One row of the knowledge base by its id (`error:N0114`, `kind:backend.usecase`, `tool:dragonfly.gen.resource`),
+  // with the title and summary of the rows it links to.
+  card(cardId: string, request: Request) <string, any>
+    allowed(request, "read")
+    found = ~asyncio.toThread(Retrieve.byId, db(), cardId)
+    if found == null
+      throw HTTPException(404, "no row `${cardId}`")
+    found
+
+  // What of a spec or a task is not possible yet or was never run for real: the capabilities rows whose `triggers`
+  // the text writes, for its platform: `{text, platform}` answers `{items: [{id, type, title, summary, trigger}]}`.
+  // Exact, never by meaning.
+  applies(body: AppliesIn, request: Request) <string, any>
+    allowed(request, "read")
+    { "items": ~asyncio.toThread(Retrieve.applies, db(), body.text, body.platform) }
+
+  // The strategy of a request: which kind of request it is (a whole system, one screen, a rename, a failing test...)
+  // and the plan of that kind. `{text, platform, existing, new}` answers `{items: [{id, title, summary, score, why,
+  // data, text}]}`, best first, at most three. By the request's exact signs first, then by meaning.
+  strategy(body: StrategyIn, request: Request) <string, any>
+    allowed(request, "read")
+    { "items": ~asyncio.toThread(Retrieve.strategy, db(), body.text, body.platform, body.existing, body.new, body.runnable, body.only) }
+
+  // What a question needs from the graph before a model answers it: `{question, platform, history, agents, k}`
+  // answers `{exact, needs, cards, facts, knowledge}`. `exact`: the questions with one right answer it is (matched to
+  // the catalogue of exact questions by meaning and by the names it writes), each run over the exact facts (SQLite)
+  // with its rows whole; `needs`: the exact questions it is close to that lack a name; `cards`: what the shelves
+  // answer by meaning; `facts` and `knowledge`: both as the text a prompt gets. No model is asked.
+  answer(body: AnswerIn, request: Request) <string, any>
+    allowed(request, "read")
+    ~asyncio.toThread(Planner.answer, db(), ~asyncio.toThread(facts), body.question, body.platform, body.history, body.agents, body.k)
+
+  // Every way a kind of a platform is written (its own word and how people say it: `use case`, `application
+  // component`) with the kind it means: what a planner needs to read a spec.
+  kinds(platform: string, request: Request) <string, string>
+    allowed(request, "read")
+    rows: <string, any>[] = ~asyncio.toThread(db().where, "platforms", Retrieve.scope(platform, false, { "type": "kind" }) ?? {})
+    out: <string, string> = {}
+    for row in rows
+      meta: <string, any> = row["meta"] ?? {}
+      if meta["facet"] == "card"
+        keys: string[] = meta["keys"] ?? []
+        for key in keys
+          out[key] = "${meta["kind"] ?? ""}"
+    out
+
+  // The prompt file of a use case (`feature`, `piece`, `test`...) or of an agent's step (`agent.repair`).
+  prompt(useCase: string, request: Request) <string, any>
+    allowed(request, "read")
+    found: <string, any>[] = ~asyncio.toThread(db().read, "prompts", { "use_case": useCase })
+    if found.length == 0
+      throw HTTPException(404, "no prompt for '${useCase}'")
+    found[0]
+
+  // Keeps what an agent learned at run time: a note about a project (`memory`) or a solved example (`examples`). The
+  // rows of the knowledge base are written only by ingest; these survive it.
+  put(body: PutIn, request: Request) <string, any>
+    client = allowed(request, "write")
+    if not (body.collection in ["memory", "examples"]) and client != "owner"
+      throw HTTPException(403, "an agent writes only `memory` and `examples`; the knowledge base is made by ingest")
+    given: <string, any> = body.meta
+    platform = "${given["platform"] ?? ""}"
+    kind = "${given["kind"] ?? ""}"
+    meta: <string, any> = { "card": body.id, "facet": "card", "type": kind.length > 0 ? kind : "note", "title": body.id, "agents": true, "platforms": [platform.length > 0 ? platform : "all"], ...given, "by": client, "origin": "runtime", "source": given["source"] ?? "${client}:${body.id}" }
+    try
+      ~asyncio.toThread(db().put, body.collection, [[body.id, body.text, meta]])
+    catch e
+      if not isinstance(e, KeyError)
+        throw e
+      throw HTTPException(404, "${e}")
+    { "id": body.id }
+
+  // Removes what an agent kept at run time (`memory`, `examples`).
+  delete(collection: string, docId: string, request: Request) <string, string>
+    client = allowed(request, "write")
+    if not (collection in ["memory", "examples"]) and client != "owner"
+      throw HTTPException(403, "an agent removes only what agents wrote: `memory` and `examples`")
+    ~asyncio.toThread(db().delete, collection, [docId])
+    { "deleted": docId }
+
+  // The rows of each collection, and the schema and revision of the knowledge base the graph holds.
+  stats(request: Request) <string, any>
+    client = allowed(request, "read")
+    { "collections": ~asyncio.toThread(db().stats), "knowledge": ~asyncio.toThread(db().version), "client": client }
+
+  // Makes the knowledge base folder `roots[0]` what the graph knows; only what changed is embedded again.
+  ingest(body: IngestIn, request: Request) <string, any>
+    allowed(request, "admin")
+    if body.roots.length == 0
+      throw HTTPException(400, "roots: the knowledge base folder")
+    ~lock.acquire()
+    try
+      lines: string[] = []
+      out: <string, any> = ~asyncio.toThread(Ingest.ingest, db(), Path(body.roots[0]), (line: string) => lines.add(line), known)
+      out["log"] = lines.slice(Math.max(0, lines.length - 200))
+      out
+    catch e
+      if not isinstance(e, ValueError)
+        throw e
+      throw HTTPException(400, "${e}")
+    finally
+      lock.release()
+
+  // A program asks for access with the scopes it needs; nothing is given until the user allows the request.
+  ask(body: AccessIn) <string, string>
+    try
+      { "request": access.ask(body.client, body.scopes, body.reason), "hint": "the user allows it with: nuclear-graph allow <request>" }
+    catch e
+      if not isinstance(e, ValueError)
+        throw e
+      throw HTTPException(400, "${e}")
+
+  // The state of an access request; once allowed, its token, a single time.
+  collect(rid: string) <string, any>
+    try
+      access.collect(rid)
+    catch e
+      if not isinstance(e, KeyError)
+        throw e
+      throw HTTPException(404, "no such request")
+
+  // The pending access requests and the allowed clients.
+  requests(request: Request) <string, any>
+    allowed(request, "admin")
+    { "requests": access.requests(), "clients": access.clients() }
+
+  // Allows or denies an access request (`allow` or `deny`).
+  decide(rid: string, decision: string, request: Request) <string, string>
+    allowed(request, "admin")
+    if not (decision in ["allow", "deny"])
+      throw HTTPException(400, "allow or deny")
+    try
+      access.decide(rid, decision == "allow")
+    catch e
+      if not isinstance(e, KeyError)
+        throw e
+      throw HTTPException(404, "${e}")
+    { "request": rid, "status": decision }
+
+  // Every route of the API, in the order the documentation lists them.
+  routes() Route[]
+    [
+      Route("get", "/v1/health", "", health),
+      Route("post", "/v1/search", "read", search),
+      Route("get", "/v1/cards/{card_id:path}", "read", card),
+      Route("post", "/v1/applies", "read", applies),
+      Route("post", "/v1/strategy", "read", strategy),
+      Route("post", "/v1/answer", "read", answer),
+      Route("get", "/v1/kinds/{platform}", "read", kinds),
+      Route("get", "/v1/prompts/{use_case}", "read", prompt),
+      Route("post", "/v1/documents", "write", put),
+      Route("delete", "/v1/documents/{collection}/{doc_id}", "write", delete),
+      Route("get", "/v1/stats", "read", stats),
+      Route("post", "/v1/ingest", "admin", ingest),
+      Route("post", "/v1/access", "", ask),
+      Route("get", "/v1/access/{rid}", "", collect),
+      Route("get", "/v1/access", "admin", requests),
+      Route("post", "/v1/access/{rid}/{decision}", "admin", decide),
+    ]
+
+// The graph's HTTP application: every route of `Api`, and no browser.
+graphApp(store: Store? = null, access: Access? = null, owner: string? = null, facts: Facts? = null) FastAPI
+  app = FastAPI(title = "Nuclear Smart Graph", version = graphVersion(), docsUrl = null, redocUrl = null, openapiUrl = null)
+  api = Api(store, access, owner, facts)
+  app.middleware("http")(api.noBrowsers)
+  for route in api.routes()
+    app.addApiRoute(route.path, route.handler, methods = [route.verb.upper()])
+  app
+
+// The routes of the HTTP API as data, for the knowledge base: [{verb, path, scope, doc}]. Nothing is opened.
+graphRoutes() <string, any>[]
+  api = Api(null, Access(Path("unused")), "", Facts())
+  api.routes().map((route) => { "verb": route.verb, "path": route.path, "scope": route.scope, "doc": inspect.getdoc(route.handler) ?? "" })

@@ -1,0 +1,170 @@
+use pathlib{ Path }
+
+SKIP = ["build", "node_modules", ".git", ".venv", ".nuclear", ".dart_tool", "dist", "target", "__pycache__"]
+
+// The files of one project, for a local agent, confined to the project's folder: the lite toolbox a coding agent
+// needs to read a project before it writes in it. Read a file, list a folder, find files, search a text, outline a
+// file's declarations, find the files that declare the names a task writes (its context), and give every file that
+// writes a name with another name in its place (a rename). Nothing outside the project is reached; generated,
+// vendored and hidden folders are never read. Answers are short texts a small model can read.
+//
+// It only reads: an agent's files are written by the Loop, which keeps the ledger that undoes them.
+Workspace(root: string = ".")
+  base: Path = Path(root).resolve()
+
+  // The parts of a path under the project's folder.
+  parts(path: Path) string[]
+    out: string[] = []
+    for part in path.relativeTo(base).parts
+      out.add(part)
+    out
+
+  skipped(path: Path) boolean
+    parts(path).any((part) => part in SKIP)
+
+  // A path of the project, or an error when it is outside it, generated or hidden.
+  inside(rel: string) Path
+    path: Path = base.joinpath(rel).resolve()
+    if path != base and not (base in path.parents)
+      throw ValueError("${rel} is outside the project")
+    if skipped(path)
+      throw ValueError("${rel} is generated or hidden: an agent reads only the project's own files")
+    path
+
+  files(pattern: string) Path[]
+    found: Path[] = []
+    for path in base.glob(pattern)
+      if path.isFile() and not skipped(path)
+        found.add(path)
+    found.sorted()
+
+  // The path of a file as the project names it.
+  named(path: Path) string
+    path.relativeTo(base).asPosix()
+
+  // A file's lines, numbered, from `start`, at most `lines` of them.
+  read(path: string, start: int = 1, lines: int = 200) string
+    try
+      text = linesOf(inside(path).readText(errors = "replace"))
+      part = text.slice(start - 1, start - 1 + lines)
+      left = text.length - (start - 1 + part.length)
+      more = left > 0 ? "\n… ${left} more lines (read from line ${start + part.length})" : ""
+      numbered: string[] = []
+      for at in 0..part.length
+        numbered.add("${"${start + at}".padStart(4)}  ${part[at]}")
+      "${numbered.join("\n")}${more}"
+    catch e
+      "not read: ${e}"
+
+  // What a folder holds, one name per line (a folder ends with `/`).
+  list(folder: string = "") string
+    try
+      entries: Path[] = []
+      for entry in inside(folder.length > 0 ? folder : ".").iterdir()
+        entries.add(entry)
+      shown = entries.filter((p) => not (p.name in SKIP) and not p.name.startswith(".")).sortedBy((p) => [p.isFile(), p.name])
+      shown.length > 0 ? shown.map((p) => "${p.name}${p.isDir() ? "/" : ""}").join("\n") : "(empty)"
+    catch e
+      "not listed: ${e}"
+
+  // The project's files that match a glob (`**/*_repository.nuc`), one path per line.
+  find(pattern: string = "**/*.nuc") string
+    found = files(pattern).take(200).map((p) => named(p))
+    found.length > 0 ? found.join("\n") : "(none)"
+
+  // The lines that have a text (a regular expression) in the files of a glob: `path:line: text`.
+  grep(text: string, pattern: string = "**/*.nuc", limit: int = 40) string
+    wanted: any = null
+    try
+      wanted = re.compile(text)
+    catch e
+      wanted = re.compile(re.escape(text))
+    out: string[] = []
+    for file in files(pattern)
+      lines = linesOf(file.readText(errors = "replace"))
+      for at in 0..lines.length
+        if wanted.search(lines[at]) != null
+          out.add("${named(file)}:${at + 1}: ${lines[at].trim()}")
+          if out.length == limit
+            return "${out.join("\n")}\n… (more)"
+    out.length > 0 ? out.join("\n") : "(no line has it)"
+
+  // The declarations of a `.nuc` file: each with its kind word, its name and its members' signatures.
+  outline(path: string) string
+    try
+      text: string = inside(path).readText(errors = "replace")
+      out: string[] = []
+      starts = declarationPattern().findAll(text).filter((m) => not text.substring(0, m.start).endsWith("// ") and not text.substring(0, m.start).endsWith("//"))
+      member = Regex(r"^  (?:@.*\n  )*([a-z][A-Za-z0-9]*\??(?:\([^\n]*\))?[^\n=]*?)\s*(?:=.*)?$", multiline = true)
+      for at in 0..starts.length
+        m = starts[at]
+        body = text.substring(m.end, at + 1 < starts.length ? starts[at + 1].start : text.length)
+        rest = text.substring(m.start)
+        line = rest.indexOf("\n")
+        out.add((line < 0 ? rest : rest.substring(0, line)).trim())
+        for found in member.findAll(body)
+          out.add("  ${(found[1] ?? "").trim()}")
+      out.length > 0 ? out.join("\n") : "(no declaration)"
+    catch e
+      "not read: ${e}"
+
+  // Every declaration of the project's `.nuc` files: its name → the file that declares it.
+  declarations() <string, string>
+    found: <string, string> = {}
+    pattern = declarationPattern()
+    for file in files("**/*.nuc")
+      rel = named(file)
+      for m in pattern.findAll(file.readText(errors = "replace"))
+        name = m[2] ?? ""
+        if not (name in found)
+          found[name] = rel
+    found
+
+  // The names a rename changes: `old` itself and every declaration of the project whose name is built from it by
+  // putting words before or after (`NewBook`, `BookRepository`, `CreateBook` for `Book`), each with `new` in its
+  // place. A framework binds some of them to it by their name (a repository to its entity), so they follow it. A
+  // plural (`ListBooks`) is another word and stays.
+  renames(old: string, new: string) <string, string>
+    names: <string, string> = {}
+    names[old] = new
+    escaped: string = re.escape(old)
+    built = Regex("^(?:[A-Z][a-z0-9]*)*${escaped}(?:[A-Z][a-z0-9]*)*$")
+    if old.length > 0 and old.substring(0, 1) != old.substring(0, 1).lower()
+      for name in declarations().keys
+        if name != old and built.test(name)
+          names[name] = name.replaceAll(old, new)
+    names
+
+  // A rename done by a tool, not by a model: every `.nuc` file that writes one of the names the rename changes
+  // (`renames`) as a word, as its path → its whole text with the new names. Nothing is written: the caller writes
+  // the files (the Loop, which can undo them) and the compiler and the tests say whether a use was missed.
+  renamed(old: string, new: string) <string, string>
+    names: <string, string> = renames(old, new)
+    longest = names.keys.sortedBy((n) => -n.length)
+    word = Regex("\\b(${longest.map((n) => "${re.escape(n)}").join("|")})\\b")
+    out: <string, string> = {}
+    for file in files("**/*.nuc")
+      text: string = file.readText(errors = "replace")
+      if word.test(text)
+        out[named(file)] = text.replaceAll(word, (m) => names[m[1] ?? ""] ?? m.text)
+    out
+
+  // The project's files that declare the names a task writes (`BookRepository`, `Book`), each as a ```nuclear block
+  // under its path: what a piece depends on. `skip`: the file being written.
+  context(task: string, skip: string = "", most: int = 5, size: int = 1800) string
+    where: <string, string> = declarations()
+    found: string[] = []
+    for m in Regex(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)*\b").findAll(task)
+      rel = where[m.text] ?? ""
+      if rel.length > 0 and rel != skip and not (rel in found)
+        found.add(rel)
+    blocks: string[] = []
+    for rel in found.take(most)
+      whole: string = base.joinpath(rel).readText(errors = "replace")
+      text = whole.trim()
+      blocks.add("```nuclear\n// ${rel}\n${text.substring(0, Math.min(size, text.length))}${text.length > size ? "\n// ... (the file goes on)" : ""}\n```")
+    blocks.join("\n\n")
+
+// A declaration of a `.nuc` file: its kind word (when it has one) and its name.
+declarationPattern() Regex
+  Regex(r"^(?:([a-z][A-Za-z]*)\s+)?([A-Z][A-Za-z0-9]*)\b(?!\s*=)", multiline = true)

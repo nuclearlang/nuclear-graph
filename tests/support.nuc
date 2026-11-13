@@ -1,0 +1,56 @@
+use os
+use hashlib
+use pathlib{ Path }
+use fastapi/testclient{ TestClient }
+
+// What a test holds true: it fails at the line that says it when it is not.
+expect(held: boolean) void
+  if not held
+    throw AssertionError("it does not hold")
+
+// What the tests of the graph share: vectors without a model, the least row that is valid, a graph in a folder.
+Testing
+  // A bag of words hashed into 64 dimensions: enough for closest-match tests without a model. The model's prompt
+  // words (`title:`, `text:`, `task:`, `query:`) are left out, so a question and a text with its words are close.
+  static embed(texts: string[]) double[][]
+    out: double[][] = []
+    skipped = ["title:", "text:", "task:", "query:", "search", "result", "none"]
+    for text in texts
+      vector: double[] = []
+      for at in 0..64
+        vector.add(0.0)
+      for word in text.lower().replaceAll("|", " ").split(Regex(r"\s+"))
+        if word.length > 0 and not (word in skipped)
+          clean = stripChars(word, ".,?`'")
+          digest: Bytes = hashlib.md5(clean.toBytes()).digest()
+          slot = (digest[0] * 256 + digest[1]) % 64
+          vector[slot] = vector[slot] + 1.0
+      out.add(vector)
+    out
+
+  // A valid row with the least to write; `more` gives or replaces fields.
+  static row(id: string, more: <string, any>? = null) <string, any>
+    extra: <string, any> = more ?? {}
+    { "id": id, "type": "diagnostic", "title": id, "summary": "A summary.", "body": "A body.", ...extra }
+
+  static shelve(store: Store, shelf: string, rows: <string, any>[]) void
+    for row in rows
+      store.put(shelf, Assets.facets(row, shelf, "generated"))
+
+  static store(folder: Path) Store
+    os.environ["NUCLEAR_GRAPH_HOME"] = "${folder}"
+    Store("${folder.joinpath("db")}", key = "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk".toBytes(), embed = Testing.embed)
+
+  // The graph's HTTP API over a store and the grants of a folder; the owner's token is `owner-token`.
+  static http(folder: Path, store: Store, facts: Facts? = null) TestClient
+    TestClient(graphApp(store, Access(folder.joinpath("grants.json")), "owner-token", facts))
+
+  static auth(token: string = "owner-token") <string, string>
+    { "Authorization": "Bearer ${token}" }
+
+  // The rows of shelves as an ingest loads them.
+  static loaded(byShelf: <string, <string, any>[]>) <string, Loaded[]>
+    out: <string, Loaded[]> = {}
+    for shelf, rows in byShelf
+      out[shelf] = rows.map((row) => Loaded(row, "generated"))
+    out

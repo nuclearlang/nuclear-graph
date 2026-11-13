@@ -1,0 +1,165 @@
+use tomllib
+
+PLATFORM_OF = { "fastapi": "backend", "nestjs": "backend", "flutter": "mobile", "react": "web" }
+REPO_OF = { "backend": "dragonfly-backend", "mobile": "dragonfly-mobile", "web": "dragonfly-web" }
+SAMPLE = { "Name": "Book", "name": "book", "Component": "Books", "component": "books", "table": "books" }
+// How people write a kind when it is not its own word: the planner reads them from the kind's keys.
+ALIASES = {
+  "appcomponent": ["app component", "application component"], "usecase": ["use case"], "statemanager": ["state manager"],
+  "statemodel": ["state model"], "formmanager": ["form manager"], "appConfig": ["app config", "application config"],
+}
+
+// The platform a dialect builds ("" for a language dialect).
+platformOfDialect(dialect: string) string
+  known: <string, string> = PLATFORM_OF
+  known[dialect] ?? ""
+
+// The files that say what a platform is: its contract, and the words and the manifest of its default dialect.
+PlatformFiles(contract: <string, any>, docs: <string, any>, dialect: <string, any>, base: string)
+
+// The rows of the platforms shelf that have a source: the contract of each platform and the words of its default
+// dialect; and what its generators write.
+ExtractPlatforms
+  static filesOf(ctx: Context, p: string) PlatformFiles
+    repos: <string, string> = REPO_OF
+    base = "${repos[p]}/dialects/${p}"
+    contract: <string, any> = tomllib.loads(ctx.read("${base}/platform.toml"))
+    chosen: string = textAt(tableAt(contract, "platform"), "default_dialect")
+    docs: <string, any> = tomllib.loads(ctx.read("${base}/${chosen}/docs.toml"))
+    dialect: <string, any> = tomllib.loads(ctx.read("${base}/${chosen}/dialect.toml"))
+    PlatformFiles(contract, docs, dialect, base)
+
+  static platform(ctx: Context, p: string) <string, any>[]
+    files = ExtractPlatforms.filesOf(ctx, p)
+    contract = files.contract
+    base = files.base
+    info: <string, any> = tableAt(contract, "platform")
+    if info.length == 0
+      return []
+    kinds: string[] = listAt(info, "kinds")
+    decorators: string[] = listAt(info, "decorators")
+    plugins: string[] = listAt(info, "plugins")
+    layout: <string, any> = tableAt(contract, "layout")
+    skeletons: <string, any> = tableAt(contract, "skeletons")
+    kindDocs: <string, any> = tableAt(files.docs, "kinds")
+    decoDocs: <string, any> = tableAt(files.docs, "decorators")
+    args: <string, any> = tableAt(tableAt(contract, "decorators"), "args")
+    chosen = textAt(info, "default_dialect")
+    sources = ["${base}/platform.toml", "${base}/${chosen}/docs.toml"]
+    sample: <string, string> = SAMPLE
+    aliases: <string, string[]> = ALIASES
+    rows: <string, any>[] = []
+    for kind in kinds
+      doc: string = Assets.nuclearOnly(textAt(kindDocs, kind).trim())
+      if doc.length == 0
+        ctx.problems.add("${p}: the kind `${kind}` has no entry in docs.toml")
+        continue
+      body = [doc]
+      if kind in layout
+        body.addAll(["", "Its file: `${layout[kind]}` (`{component}`: the component's folder, `{file}`: the name in snake_case)."])
+      if kind in skeletons
+        code = textAt(skeletons, kind).trim().replaceAll(Regex(r"\{\{(\w+)\}\}"), (m) => sample[m[1] ?? ""] ?? (m[1] ?? ""))
+        body.addAll(["", "The smallest file of the kind (what `dragonfly make ${kind} books Book` writes):", "", "```nuclear", code, "```"])
+      used: string[] = Regex(r"@(\w+)").findAll(doc).map((m) => m[1] ?? "").filter((d) => d in decorators).unique().sorted()
+      links: <string, any>[] = used.filter((d) => d in decoDocs).map((d) => { "rel": "uses", "to": "decorator:${p}.${d}" })
+      links.add({ "rel": "placed-by", "to": "layout:${p}" })
+      rows.add({
+        "id": "kind:${p}.${kind}", "type": "kind", "title": "`${kind}` — a kind of the ${p} platform",
+        "summary": firstSentence(doc), "body": body.join("\n"), "keys": [kind.lower(), ...(aliases[kind] ?? [])].unique().sorted(),
+        "platforms": [p], "links": links, "sources": sources, "meta": { "kind": kind, "name": kind },
+        "data": { "platform": p, "file": textAt(layout, kind), "aliases": aliases[kind] ?? [], "decorators": used },
+      })
+    for deco in decorators
+      told: string = Assets.nuclearOnly(textAt(decoDocs, deco).trim())
+      if told.length == 0
+        // a decorator the platform consumes without a word of its own (documented with its kind)
+        continue
+      extra = ""
+      if deco in args
+        named: string[] = listAt(args, deco)
+        extra = "\n\nIts arguments: ${named.length > 0 ? ticked(named) : "none"} (`!` = required)."
+      rows.add({
+        "id": "decorator:${p}.${deco}", "type": "decorator", "title": "`@${deco}` — a decorator of the ${p} platform",
+        "summary": firstSentence(told), "body": "${told}${extra}", "keys": ["@${deco.lower()}", deco.lower()], "platforms": [p],
+        "sources": sources, "meta": { "name": deco },
+        "data": { "platform": p, "decorator": deco, "args": listAt(args, deco) },
+      })
+    if layout.length > 0
+      table = layout.keys.sorted().map((k) => "- `${k}` → `${layout[k]}`").join("\n")
+      rows.add({
+        "id": "layout:${p}", "type": "layout", "title": "Where each kind's file goes in a ${p} project",
+        "summary": "The folder and file name of every kind of a ${p} project: `{component}` is the component's folder, `{screen}` the screen's, `{file}` the declaration's name in snake_case.",
+        "body": "`nuclear help layout --platform ${p}` prints it; `dragonfly make` and the generators follow it.\n\n${table}",
+        "keys": ["layout", "${p} layout"], "platforms": [p], "sources": ["${base}/platform.toml"], "meta": { "name": "layout" },
+        "data": { "platform": p, "files": layout.keys.sorted().map((k) => { "kind": k, "file": "${layout[k]}" }) },
+        "asks": ["where does the file of each kind go in a ${p} project", "in which folder do I put a repository, a use case or a model of a ${p} project"],
+      })
+    known: <string, any> = tableAt(tableAt(files.dialect, "project"), "plugins")
+    for name in plugins
+      plug = tableAt(known, name)
+      described: string = textAt(plug, "description").trim()
+      parts = [described.length > 0 ? described : "An optional part of the ${p} platform."]
+      brings: string[] = listAt(plug, "kinds")
+      if brings.length > 0
+        parts.add("Kinds it brings: ${ticked(brings)}.")
+      requires: string[] = listAt(plug, "requires")
+      if requires.length > 0
+        parts.add("It enables: ${ticked(requires)}.")
+      parts.add("Enable it in `config.nuc`: `plugins(${name} = true)`. A kind or a name of a plugin that is not enabled is `N0304`, which says the line to add.")
+      rows.add({
+        "id": "plugin:${p}.${name}", "type": "plugin", "title": "`${name}` — a plugin of the ${p} platform",
+        "summary": firstSentence(parts[0]), "body": parts.join("\n\n"), "keys": [name.lower(), "plugin ${name.lower()}"], "platforms": [p],
+        "links": [{ "rel": "missing-is", "to": "error:N0304" }], "sources": ["${base}/platform.toml", "${base}/${chosen}/dialect.toml"],
+        "meta": { "name": name },
+        "data": { "platform": p, "plugin": name, "kinds": brings, "requires": requires },
+      })
+    dialects: string[] = []
+    folder = ctx.tree.joinpath(base)
+    if folder.isDir()
+      for d in folder.iterdir()
+        if d.joinpath("dialect.toml").isFile()
+          dialects.add(d.name)
+    dialects.sort()
+    listing = kinds.map((k) => "- `${k}`: ${firstSentence(Assets.nuclearOnly(textAt(kindDocs, k)), 160)}").join("\n")
+    has: <string, any>[] = kinds.filter((k) => k in kindDocs).map((k) => { "rel": "has", "to": "kind:${p}.${k}" })
+    if layout.length > 0
+      has.add({ "rel": "has", "to": "layout:${p}" })
+    rows.add({
+      "id": "platform:${p}", "type": "platform", "title": "The ${p} platform of Dragonfly",
+      "summary": "The ${p} platform: ${textAt(info, "description")}. ${kinds.length} kinds, ${decorators.length} decorators, ${plugins.length} plugins; built by the dialects ${dialects.join(", ")} (default: ${ExtractPlatforms.written(info, "default_dialect")}).",
+      "body": "A project of the platform is written once in Nuclear and builds with any of its dialects (${ticked(dialects)}; `${ExtractPlatforms.written(info, "default_dialect")}` when none is named). Create one: `dragonfly new <name> -p ${p}`.\n\nIts kinds:\n\n${listing}\n\nIts plugins: ${plugins.length > 0 ? ticked(plugins) : "none"}.",
+      "keys": [p, "${p} platform"], "platforms": [p], "links": has, "sources": ["${base}/platform.toml"], "meta": { "name": p },
+      "data": { "platform": p, "default_dialect": chosen, "dialects": dialects, "kinds": kinds, "decorators": decorators, "plugins": plugins },
+    })
+    rows
+
+  // A field as the contract writes it (`None` when it is not there: what the rows always said).
+  static written(info: <string, any>, key: string) string
+    key in info ? "${info[key]}" : "None"
+
+  // What `dragonfly gen` writes on each platform, from the platform's own templates.
+  static generators(ctx: Context) <string, any>[]
+    rows: <string, any>[] = []
+    for p in platformNames()
+      files = ExtractPlatforms.filesOf(ctx, p)
+      known: <string, any> = tableAt(files.contract, "generators")
+      for what, value in known
+        pieces: <string, any>[] = value
+        lines: string[] = []
+        parts: <string, any>[] = []
+        for piece in pieces
+          parts.add({ "kind": "${piece["kind"] ?? ""}", "name": "${piece["name"] ?? ""}", "when": textAt(piece, "when"), "each": textAt(piece, "each"), "merge": piece["merge"] == true })
+          cond = textAt(piece, "when").length > 0 ? " (when `${piece["when"]}`)" : ""
+          each = textAt(piece, "each").length > 0 ? ", one per `${piece["each"]}`" : ""
+          merge = piece["merge"] == true ? ", added to the file when it exists" : ""
+          lines.add("- ${piece["kind"] ?? "?"} `${piece["name"] ?? ""}`${cond}${each}${merge}")
+        kinds = pieces.map((x) => ExtractPlatforms.written(x, "kind")).unique().sorted()
+        rows.add({
+          "id": "generator:${p}.${what}", "type": "generator", "title": "`dragonfly gen ${what}` on the ${p} platform: what it writes",
+          "summary": "The files `dragonfly gen ${what}` writes in a ${p} project, finished and compiling: ${clip(kinds.join(", "), 200)}.",
+          "body": "Each piece is a file at its kind's place (`nuclear help layout --platform ${p}`); nothing is overwritten.\n\n${lines.join("\n")}\n\nThe names: `{{Name}}` the resource, `{{Names}}` its plural, `{{Component}}` the component, `{{UseCase}}` one per action.",
+          "keys": ["gen ${what}", "dragonfly gen ${what}"], "platforms": [p], "links": [{ "rel": "run-by", "to": "tool:dragonfly.gen.${what}" }],
+          "sources": ["${files.base}/platform.toml"], "meta": { "tool": "dragonfly", "name": "gen ${what}" },
+          "data": { "platform": p, "command": "dragonfly gen ${what}", "pieces": parts },
+        })
+    rows

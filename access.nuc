@@ -1,0 +1,137 @@
+use os
+use time
+use hashlib
+use secrets
+use pathlib{ Path }
+
+SCOPES = ["read", "write", "admin"]
+
+scopeNames() string[] = SCOPES
+
+// A client the graph knows, by its token: its name and what it may do.
+Client(name: string, scopes: string[])
+
+// Who may use the graph. A program asks for access (`POST /v1/access`); nothing is given until the user allows it
+// (`nuclear-graph allow <request>` or the editor). Each allowed client has its own token, stored only as a hash, and
+// scopes: `read` (search, prompts, examples), `write` (remember, add examples), `admin` (ingest, manage).
+Access
+  grants: Path
+
+  // `file`: where the grants are kept (the data folder's `grants.json` when left out).
+  (file: Path? = null)
+    grants = file ?? Paths.grants()
+
+  static hashOf(token: string) string
+    hashlib.sha256(token.toBytes()).hexdigest()
+
+  // Now, in seconds since the epoch.
+  static now() int
+    seconds: double = time.time()
+    seconds.toInt()
+
+  load() <string, any>
+    if not grants.isFile()
+      return { "clients": {}, "requests": {} }
+    json.loads(grants.readText())
+
+  save(data: <string, any>) void
+    tmp: Path = grants.withSuffix(".tmp")
+    // 0600
+    tmp.touch(mode = 384)
+    tmp.writeText(json.dumps(data, indent = 2))
+    os.chmod(tmp, 384)
+    tmp.replace(grants)
+
+  // ---- clients ----
+
+  // Gives `client` a new token with `scopes` (its old token stops working). The token is shown once.
+  grant(client: string, scopes: string[]) string
+    if scopes.length == 0 or scopes.any((s) => not (s in SCOPES))
+      throw ValueError("scopes must be some of ${SCOPES.join(", ")}")
+    token = "ng_${secrets.tokenUrlsafe(32)}"
+    data = load()
+    known: <string, any> = data["clients"]!
+    known[client] = { "hash": Access.hashOf(token), "scopes": scopes, "created": Access.now() }
+    save(data)
+    token
+
+  revoke(client: string) boolean
+    data = load()
+    known: <string, any> = data["clients"]!
+    found = known.remove(client) != null
+    save(data)
+    found
+
+  clients() <string, any>
+    out: <string, any> = {}
+    known: <string, any> = load()["clients"]!
+    for name, c in known
+      out[name] = { "scopes": c["scopes"], "created": c["created"] }
+    out
+
+  // The client and scopes of a token; the owner's token has every scope.
+  who(token: string, owner: string = "") Client?
+    if owner.length > 0 and secrets.compareDigest(token, owner)
+      return Client("owner", SCOPES.copy())
+    hashed = Access.hashOf(token)
+    known: <string, any> = load()["clients"]!
+    for name, c in known
+      if secrets.compareDigest(c["hash"], hashed)
+        return Client(name, c["scopes"])
+    null
+
+  // ---- requests ----
+
+  ask(client: string, scopes: string[], reason: string = "") string
+    if client.length == 0 or client.length > 80 or scopes.any((s) => not (s in SCOPES) or s == "admin")
+      throw ValueError("a client name and scopes among read, write")
+    data = load()
+    asked: <string, any> = data["requests"]!
+    if asked.values.count((r) => r["status"] == "pending") >= 20
+      throw ValueError("too many pending requests")
+    rid: string = secrets.tokenHex(4)
+    asked[rid] = { "client": client, "scopes": scopes.length > 0 ? scopes : ["read"], "reason": reason.substring(0, Math.min(200, reason.length)), "status": "pending", "created": Access.now() }
+    save(data)
+    rid
+
+  requests() <string, any>
+    out: <string, any> = {}
+    known: <string, any> = load()["requests"]!
+    for rid, r in known
+      shown: <string, any> = {}
+      fields: <string, any> = r
+      for key, value in fields
+        if key != "token"
+          shown[key] = value
+      out[rid] = shown
+    out
+
+  decide(rid: string, allow: boolean) void
+    data = load()
+    asked: <string, any> = data["requests"]!
+    r = asked[rid]
+    if r == null or r["status"] != "pending"
+      throw KeyError("no pending request '${rid}'")
+    if allow
+      token = grant(r["client"], r["scopes"])
+      data = load()
+      again: <string, any> = data["requests"]!
+      again[rid]["status"] = "allowed"
+      again[rid]["token"] = token
+    else
+      r["status"] = "denied"
+    save(data)
+
+  // The state of a request; an allowed one hands its token once, then forgets it.
+  collect(rid: string) <string, any>
+    data = load()
+    asked: <string, any> = data["requests"]!
+    r = asked[rid]
+    if r == null
+      throw KeyError(rid)
+    out: <string, any> = { "status": r["status"], "client": r["client"], "scopes": r["scopes"] }
+    if r["status"] == "allowed" and "token" in r
+      out["token"] = r.pop("token")
+      r["status"] = "collected"
+      save(data)
+    out

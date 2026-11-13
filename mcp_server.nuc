@@ -1,0 +1,391 @@
+use os
+use asyncio
+use logging
+use httpx
+use httpx{ Response }
+use pathlib{ Path }
+use mcp/server/mcpserver{ MCPServer }
+
+DEVELOPER_URL = os.environ.get("NUCLEAR_DEVELOPER_URL") ?? "http://127.0.0.1:7879"
+DRAGONFLY_COMMANDS = ["new", "n", "build", "install", "test", "check", "analyze", "make", "g", "gen", "migrate", "add", "explain"]
+
+// What the server tells every client. The generators' part is the same with or without the local agents.
+LEAD = "NuclearLang and Dragonfly. The generators write the standard code, the local Nuclear Developer writes what is left; you lead, validate and correct. For any request, first call graph_strategy with the user's own words: it answers which kind of request it is (a whole system, one screen, a rename, a failing test...) and the plan of that kind; follow that plan. "
+GENERATORS = "For a feature: 0) project_inspect the project; for every resource the spec names (a model and what is done with it: list, get, search, create, update, delete), call generate_resource. Its fields come from the API's answer (from_json with the url or a file: api_inspect shows its shape first), from the spec (from_spec: its example answer or its Key | Type table) or from fields; when neither the spec nor the API gives them, look up the API's documentation with web_search and web_read, and if it is still unclear ask the user, never guess. A use case that only calls a repository method is generate_usecase with calls. "
+LOCAL = "Then give developer_task only what the generators did not write (a use case with its own rules, a view's details), and wire each use case it wrote with generate_usecase (its alias in the facade, its route). For any task that writes or changes .nuc (a feature, a bug, a refactor, tests): 1) call developer_task first with the project folder, a title, the description and the acceptance criteria: the local agents plan, write the tests first, write the code, run the tests and the security review, and document everything they did in a journal it returns; 2) read the journal, then validate: nuclear_check of the project must say ok and dragonfly test must pass; 3) correct only what failed or is wrong, never rewrite what passed; before writing .nuc read nuclear_brief(<platform>: backend, mobile or web) and search the graph instead of guessing; If the run failed, read its 'Why it failed' (the local diagnoser): when the cause was passing or you fixed it, call developer_retry instead of starting again. 4) call developer_review with the run, what you corrected and why, and the corrected files, so the journal keeps your review and the local developer learns from it. Write the code yourself only when developer_task cannot run (the local developer is not running) and say so."
+// A machine set up for remote agents only (ADR-0106) has no Smart Graph and no local developer: the model writes
+// what the generators do not, and the tools that need those services are left out.
+REMOTE_LEAD = "NuclearLang and Dragonfly. The generators write the standard code; you write what is left, then validate and correct. This machine has no local agents and no Smart Graph (its user chose remote agents only; `nuclear-loop setup` installs them). "
+REMOTE = "Then write only what the generators did not write (a use case with its own rules, a view's details): before writing .nuc read nuclear_brief(<platform>: backend, mobile or web) and look up a kind, a decorator or a command with nuclear_help instead of guessing; wire each use case you wrote with generate_usecase (its alias in the facade, its route). Then validate: nuclear_check of the project must say ok and dragonfly test must pass; correct only what failed, never rewrite what passed."
+
+// Whether this machine was set up for remote agents only (`NUCLEAR_AI_MODE`, else the machine's `ai.env`).
+remoteOnly() boolean
+  mode: string = os.environ.get("NUCLEAR_AI_MODE") ?? (Paths.machine()["NUCLEAR_AI_MODE"] ?? "local")
+  mode == "remote"
+
+// The closest folder up with a config.nuc (a Dragonfly project).
+projectOf(folder: string) Path?
+  start: Path = Path(folder).resolve()
+  for d in [start, ...start.parents]
+    if d.joinpath("config.nuc").exists()
+      return d
+  null
+
+taskSlug(text: string) string
+  whole = stripChars(text.lower().replaceAll(Regex(r"[^a-z0-9]+"), "-"), "-")
+  cut = whole.substring(0, Math.min(40, whole.length))
+  cut.length > 0 ? cut : "task"
+
+// The spec file the Loop reads (the shape of `specMarkdown` in the Loop engine), led by the local agents.
+specMarkdown(title: string, description: string, criteria: string[], useCase: string) string
+  items = criteria.length > 0 ? criteria.map((c) => "- [ ] ${c}") : ["- (none yet)"]
+  lines = ["# ${title}", "", "- Use case: ${useCase}", "- Source: local", "- Lead: local agents only", "", "## Description", "", description.trim(), "", "## Acceptance criteria", "", ...items]
+  "${lines.join("\n")}\n"
+
+// What a JSON value is, in Nuclear's words.
+shapeKind(value: any) string
+  if value == null
+    return "null (optional)"
+  if value is boolean
+    return "boolean"
+  if value is int
+    return "int"
+  if value is double
+    return "double"
+  if value is string
+    return "string"
+  if value is any[]
+    return "empty list"
+  "empty object"
+
+// The shape of a JSON value, one key per line: `name: string`, a nested object indented, a list by its first item.
+shape(value: any, depth: int = 0) string
+  pad = "  ".repeat(depth)
+  if isinstance(value, dict)
+    lines: string[] = []
+    held: <string, any> = value
+    for key, v in held
+      if (isinstance(v, dict) or v is any[]) and v
+        lines.add("${pad}${key}: ${isinstance(v, dict) ? "object" : "list of"}")
+        lines.add(shape(v, depth + 1))
+      else
+        lines.add("${pad}${key}: ${shapeKind(v)}")
+    return lines.join("\n")
+  if value is any[] and value
+    return shape(value[0], depth)
+  "${pad}${shapeKind(value)}"
+
+// The tools of the MCP server of NuclearLang (stdio): the Nuclear Smart Graph, the `nuclear` and `dragonfly` command
+// line tools and the local developer agents, for any MCP client (Claude Code, Codex, Cursor...). The graph is
+// reached with the token of the client `mcp` (`nuclear-graph connect mcp`), so the user decides whether MCP clients
+// may read it. Each method with a comment is a tool, and the comment is what the client reads of it.
+McpTools(graph: GraphClient, tools: Toolchain, web: Web)
+  // Search the Nuclear Smart Graph, by meaning and by exact name (a diagnostic code, a command, a kind). shelf:
+  // concepts (what it is, why, how it works), language (how it is written in Nuclear), platforms (kinds, decorators,
+  // layout, plugins), tools (CLI commands, MCP tools, HTTP routes, generators, agents), errors (diagnostics, failures
+  // and their fixes), capabilities (what can and cannot be done, limits), playbooks (procedures, roles, skills),
+  // examples (validated Nuclear), docs (the long documents: dialects, ADRs, context, status), memory (what agents kept
+  // about projects); several separated by commas; "" searches every shelf. platform: backend, mobile, web. kind: a
+  // kind's rows (usecase, repository...). type: a row type (diagnostic, kind, cli, playbook...). Each card comes with
+  // the rows it links to.
+  graphSearch(query: string, shelf: string = "", k: int = 5, platform: string = "", kind: string = "", type: string = "") string
+    ~graph.search(query, shelf, k, platform, kind, type, expand = true)
+
+  // The exact answer to a question that has one (every command of a tool, the tools of this server and their
+  // parameters, the commands that write a kind, a diagnostic by its code, the stages of the Loop, the members of a
+  // base type, a version...): the rows of the graph's database, whole, never recalled; then the cards the shelves
+  // answer by meaning. Prefer it to graph_search for "which", "list", "what are the" questions. platform: backend,
+  // mobile or web.
+  graphAnswer(question: string, platform: string = "") string
+    found: <string, string> = ~graph.answer(question, platform, agents = false)
+    facts = found["facts"] ?? ""
+    needs = found["needs"] ?? ""
+    exact = facts.length > 0 ? "## Exact facts (the graph's database: complete)\n\n${facts}\n\n" : ""
+    close = needs.length > 0 ? "## Exact questions it is close to, when a name is given\n\n${needs}\n\n" : ""
+    "${exact}${close}## Cards\n\n${found["knowledge"] ?? ""}"
+
+  // Which kind of request this is (a whole system, a component, a resource, one screen, a use case, a rename, a
+  // failing test, a question...) and the plan of that kind, step by step with the tool of each step. Call it first,
+  // with the user's request in their own words, and follow the plan it answers. platform: backend, mobile or web.
+  graphStrategy(request: string, platform: string = "") string
+    found: <string, string> = ~graph.strategy(request, platform)
+    if found.length == 0
+      return "the graph has no strategy: `nuclear-graph ingest` the knowledge base"
+    why = found["why"] ?? ""
+    second = found["second"] ?? ""
+    "${found["id"]} (${why.length > 0 ? why : "by meaning"}; the next closest: ${second.length > 0 ? second : "none"})\n\n${found["plan"]}"
+
+  // One row of the graph by its id, with what it links to: error:N0114 (a diagnostic), kind:backend.usecase,
+  // decorator:backend.get, tool:dragonfly.gen.resource, mcp:generate_resource, lib:string, platform:mobile,
+  // layout:web, playbook:<name>, concept:<name>.
+  graphCard(id: string) string
+    found: string = ~graph.card(id)
+    found.length > 0 ? found : "no row `${id}`: search it with graph_search"
+
+  // The validated prompt of a use case: feature, refactor, bug, docs, diagram, test, security, piece, plan.
+  graphPrompt(useCase: string) string
+    ~graph.prompt(useCase)
+
+  // Keep a decision, a name or a solved example (collection examples: the task, then the validated .nuc) so the
+  // local developer and later sessions find it.
+  graphRemember(id: string, text: string, collection: string = "memory", project: string = "") string
+    ~graph.remember(id, text, collection, project)
+
+  // Errors of a piece of Nuclear (code) or of a whole project (path of its folder): `ok` or one line per error
+  // with its fix.
+  nuclearCheck(code: string = "", path: string = "", dialect: string = "backend") string
+    if path.length > 0
+      return ~tools.checkProject(path)
+    ~tools.check(code, dialect)
+
+  // What a piece of Nuclear becomes in the dialect's language (Python, TypeScript, Dart).
+  nuclearBuild(code: string, dialect: string = "backend") string
+    ~tools.build(code, dialect)
+
+  // Documentation of a kind, decorator, header word (with dialect), a topic or a command.
+  nuclearHelp(word: string, dialect: string = "") string
+    ~tools.help(word, dialect)
+
+  // The short sheet of Nuclear and a platform (backend, mobile, web), or a dialect: read it before writing .nuc.
+  nuclearBrief(dialect: string = "backend") string
+    ~tools.brief(dialect)
+
+  // The piece of Nuclear in the canonical layout.
+  nuclearFmt(code: string) string
+    ~tools.fmt(code)
+
+  // A declaration of the type definitions (a class or Class.member of a library the dialect uses).
+  nuclearDefs(name: string, dialect: string) string
+    ran = ~runTool(["nuclear", "defs", "show", name, "--dialect", dialect])
+    ran.out
+
+  // A dragonfly command in a project folder: new, build, install, test, check, analyze, make (g), migrate, add,
+  // explain. Example: command="make", args=["component", "orders"].
+  dragonfly(project: string, command: string, args: string[]? = null) string
+    if not (command in DRAGONFLY_COMMANDS)
+      return "'${command}' is not allowed here (allowed: ${DRAGONFLY_COMMANDS.sorted().join(", ")})"
+    given: string[] = args ?? []
+    ~tools.dragonfly(project, [command, ...given])
+
+  // What a Dragonfly project has: its platform and dialect, its components with their declarations by kind, and
+  // the generators of its platform. Call it before generating or writing, so nothing is declared twice.
+  projectInspect(project: string) string
+    ~tools.dragonfly(project, ["gen", "inspect"])
+
+  // A new component of the project with its facade (appcomponent).
+  generateComponent(project: string, component: string) string
+    ~tools.dragonfly(project, ["gen", "component", component])
+
+  // The finished, compiling code of a resource: its models, the repository, one use case per action, the
+  // facade's aliases, the controller (backend) or, with screen, a screen with its state manager (mobile, web), and
+  // the tests. The fields: from_json (an example answer of the API: a url, which also gives the API, or a file),
+  // from_spec (a spec.md: its example answer or its Key | Type table, and its `GET <url>` line), or fields
+  // ("id:int name:string origin:Origin?"). source: "rest:<base url>", "rest" or "db" (backend only). actions: of
+  // list, get, search, create, update, delete (default: list and get for an API, the rest for a database).
+  // dry_run shows the files without writing them. Nothing is overwritten; a name declared elsewhere stops it.
+  generateResource(project: string, component: string, name: string, fromJson: string = "", fromSpec: string = "", fields: string = "", source: string = "", path: string = "", actions: string[]? = null, screen: string = "", plural: string = "", dryRun: boolean = false) string
+    args = ["gen", "resource", component, name]
+    flags: <string, string> = { "--from-json": fromJson, "--from-spec": fromSpec, "--fields": fields, "--source": source, "--path": path, "--screen": screen, "--plural": plural }
+    for flag, value in flags
+      if value.length > 0
+        args.addAll([flag, value])
+    wanted: string[] = actions ?? []
+    if wanted.length > 0
+      args.addAll(["--actions", wanted.join(",")])
+    if dryRun
+      args.add("--dry-run")
+    ~tools.dragonfly(project, args)
+
+  // A use case wired into its component: its alias in the facade and, with route (backend), its route in the
+  // controller of the route's prefix ("POST orders/{id}/cancel": a {name} is a parameter of the use case; the
+  // controller is created when missing). With calls ("OrderRepository.pending": a method that repository declares)
+  // the use case is written too, because it only calls that method. Without calls the use case must already be in
+  // the project: one with rules of its own is written first (developer_task, or by hand), then this wires it.
+  // dry_run shows the files without writing them.
+  generateUsecase(project: string, component: string, name: string, calls: string = "", route: string = "", dryRun: boolean = false) string
+    args = ["gen", "usecase", component, name]
+    flags: <string, string> = { "--calls": calls, "--route": route }
+    for flag, value in flags
+      if value.length > 0
+        args.addAll([flag, value])
+    if dryRun
+      args.add("--dry-run")
+    ~tools.dragonfly(project, args)
+
+  // A screen of a mobile or web project with its state manager and state model, for a view that is not a list of
+  // a resource (generate_resource with screen writes those).
+  generateScreen(project: string, component: string, screen: string, route: string = "") string
+    args = ["make", "screen", component, screen]
+    if route.length > 0
+      args.addAll(["--route", route])
+    ~tools.dragonfly(project, args)
+
+  // Fetches a public API's url and answers the shape of its JSON (keys, types, nested objects, a paged answer).
+  // With project, component and name it also shows the files generate_resource would write from it.
+  apiInspect(url: string, project: string = "", component: string = "", name: string = "") string
+    open: boolean = ~asyncio.toThread(publicUrl, url)
+    if not open
+      return "not read: ${url} is not a public http(s) address"
+    out = ""
+    http = httpx.AsyncClient(timeout = 20, followRedirects = true)
+    try
+      r: Response = ~http.get(url, headers = { "Accept": "application/json" })
+      out = "GET ${url} → ${r.statusCode}\n\n${shape(r.json())}"
+    catch e
+      return "${url}: no JSON answer (${e})"
+    finally
+      ~http.aclose()
+    if project.length > 0 and component.length > 0 and name.length > 0
+      written: string = ~generateResource(project, component, name, fromJson = url, dryRun = true)
+      out = "${out}\n\n${written}"
+    out
+
+  // Searches the internet (e.g. an API's documentation: "rick and morty api character schema") and answers the
+  // first results with the text of their first pages.
+  webSearch(query: string, pages: int = 2) string
+    ~web.research(query, pages = pages)
+
+  // The text of a public page (an API's documentation), without its code blocks.
+  webRead(url: string) string
+    ~web.read(url)
+
+  // One file asked of the local developer over HTTP: its check, its attempts and its code.
+  developer(path: string, body: <string, any>) string
+    http = httpx.AsyncClient(baseUrl = DEVELOPER_URL, timeout = 900)
+    try
+      r: Response = ~http.post(path, json = body)
+      if r.statusCode >= 400
+        return "developer ${path}: ${r.statusCode} ${r.text}"
+      out: <string, any> = r.json()
+      "check: ${out["check"]}\nattempts: ${out["attempts"]}\n\n```nuclear\n${out["code"] ?? ""}```"
+    catch e
+      "the local developer is not running at ${DEVELOPER_URL} (${e}); start it: nuclear-developer serve"
+    finally
+      ~http.aclose()
+
+  // FIRST STEP of every task that writes .nuc: the local Nuclear Developer does the whole task in the project
+  // folder (plan, tests first, code, verification, security, artifacts) and documents it. Give the description and
+  // one acceptance criterion per item; use_case: feature, bug, refactor, test. Answers the run's journal (every
+  // step, the files written, what is left for you); then validate and correct, and call developer_review.
+  developerTask(project: string, title: string, description: string, criteria: string[], useCase: string = "feature") string
+    root = projectOf(project)
+    if root == null
+      return "${project} is not inside a Dragonfly project (no config.nuc): create it with dragonfly(command='new')"
+    run = taskSlug(title)
+    spec: Path = root!.joinpath("specs", run, "spec.md")
+    spec.parent.mkdir(parents = true, existOk = true)
+    spec.writeText(specMarkdown(title, description, criteria, useCase))
+    ran = ~runTool(["nuclear-loop", "run", "${spec}", "--lead", "local"], cwd = "${root}", timeout = 3600)
+    journal: Path = root!.joinpath(".nuclear", "loop", "runs", "${run}.md")
+    if not journal.exists()
+      return "nuclear-loop exited ${ran.code} without a journal:\n${ran.out.substring(Math.max(0, ran.out.length - 3000))}"
+    state = ran.code == 0 ? "passed" : "did not pass: correct only what is left"
+    "run `${run}` ${state} · journal ${journal}\n\n${journal.readText()}\n\n---\nNext: validate (nuclear_check of the project, dragonfly test), correct only what is wrong, then ALWAYS finish with developer_review(project, run=\"${run}\", notes=<what you corrected and why>, files=<the .nuc paths you corrected>), also when you corrected nothing."
+
+  // A developer_task run again: from the step that failed (every step that passed is kept); the whole of from_stage
+  // (generate, plan, test, code, verify, security, artifacts, deploy), the stages before it kept; from one step
+  // (from_step: its id in the journal, `code-3`: that step and all after it, whether it passed or failed); or from
+  // scratch (scratch: every stage again, what the run wrote undone first). Read the journal's "Why it failed" first:
+  // retry when the failure was passing (a service down) or after you fixed its cause. Answers the journal again.
+  developerRetry(project: string, run: string, fromStage: string = "", fromStep: string = "", scratch: boolean = false) string
+    root = projectOf(project)
+    if root == null
+      return "${project} is not inside a Dragonfly project (no config.nuc)"
+    args = not scratch ? ["nuclear-loop", "retry", run] : ["nuclear-loop", "restart", run]
+    if not scratch and fromStep.length > 0
+      args.addAll(["--step", fromStep])
+    else if not scratch and fromStage.length > 0
+      args.addAll(["--from", fromStage])
+    ran = ~runTool(args, cwd = "${root}", timeout = 3600)
+    journal: Path = root!.joinpath(".nuclear", "loop", "runs", "${run}.md")
+    if not journal.exists()
+      return "nuclear-loop exited ${ran.code}:\n${ran.out.substring(Math.max(0, ran.out.length - 3000))}"
+    "run `${run}` ${ran.code == 0 ? "passed" : "did not pass"} · journal ${journal}\n\n${journal.readText()}"
+
+  // LAST STEP: record your review of a developer_task run: what you corrected and why (notes), and the project
+  // paths of the files you corrected. Appends it to the run's journal and keeps each corrected file, with its task,
+  // in the graph's examples so the local developer writes it right next time.
+  developerReview(project: string, run: string, notes: string, files: string[]? = null) string
+    found = projectOf(project)
+    if found == null
+      return "${project} is not inside a Dragonfly project (no config.nuc)"
+    root: Path = found!
+    runs = root.joinpath(".nuclear", "loop", "runs")
+    if not runs.joinpath("${run}.json").exists()
+      return "no run `${run}` in ${runs}"
+    spec = root.joinpath("specs", run, "spec.md")
+    task: string = spec.exists() ? spec.readText() : run
+    kept: string[] = files ?? []
+    for file in kept
+      path: Path = root.joinpath(file).resolve()
+      if not (root in path.parents) or not path.isFile() or path.suffix != ".nuc"
+        return "${file} is not a .nuc file of the project"
+    if kept.length > 0
+      checked: string = ~tools.checkProject("${root}")
+      if checked != "ok"
+        return "nuclear check of the project is not ok yet: correct it before the review"
+    for file in kept
+      code: string = root.joinpath(file).resolve().readText()
+      ~graph.remember("review-${run}-${taskSlug(file)}", "${task}\nFile `${file}`:\n\n```nuclear\n${code}```", "examples", root.name)
+    review = runs.joinpath("${run}.review.md")
+    corrected = kept.map((f) => "- corrected `${f}`\n").join("")
+    handle = review.open("a")
+    try
+      handle.write("## Review by the lead\n\n${notes.trim()}\n\n${corrected}\n")
+    finally
+      handle.close()
+    added = "; ${kept.length} corrected file(s) added to the graph's examples"
+    "review kept in ${review}${kept.length > 0 ? added : ""}"
+
+  // Ask the local developer (a 3B model with the graph) for ONE .nuc file, outside a developer_task run (a quick
+  // piece, a rewrite of one file). A short, complete order: the path, the kind, every name and signature it must use
+  // and the platform (backend, mobile, web; it writes only Nuclear). With project (the project's folder) it reads by
+  // itself the files that declare the names the task writes; otherwise paste them in context. It checks its answer
+  // with the compiler, repairs it, holds it to the task's own words and returns it; it does not write the file.
+  developerCode(task: string, platform: string = "backend", path: string = "", kind: string = "", context: string = "", project: string = "") string
+    root = project.length > 0 ? projectOf(project) : null
+    ~developer("/developer/code", { "task": task, "platform": platform, "path": path, "kind": kind, "context": context, "root": root != null ? "${root}" : "" })
+
+  // Ask the local tester for the Nuclear tests (`tests` kind) of a piece of code.
+  developerTest(task: string, code: string, platform: string = "backend") string
+    ~developer("/developer/test", { "task": task, "platform": platform, "context": code })
+
+  // Ask the local security reviewer for the findings of a piece of code.
+  developerSecurity(code: string, platform: string = "backend") string
+    ~developer("/developer/security", { "task": "review", "platform": platform, "context": code })
+
+  // Every tool, in the order a client lists them.
+  all() any[]
+    [
+      graphSearch, graphAnswer, graphStrategy, graphCard, graphPrompt, graphRemember, nuclearCheck, nuclearBuild, nuclearHelp, nuclearBrief, nuclearFmt, nuclearDefs,
+      dragonfly, projectInspect, generateComponent, generateResource, generateUsecase, generateScreen, apiInspect, webSearch, webRead,
+      developerTask, developerRetry, developerReview, developerCode, developerTest, developerSecurity,
+    ]
+
+// The MCP server with its tools. A machine set up for remote agents only gets neither the graph's nor the local
+// developer's.
+mcpServer() MCPServer
+  remote = remoteOnly()
+  server = MCPServer("nuclear", instructions = remote ? "${REMOTE_LEAD}${GENERATORS}${REMOTE}" : "${LEAD}${GENERATORS}${LOCAL}")
+  tools = McpTools(GraphClient("mcp"), Toolchain(), Web())
+  for tool in tools.all()
+    name: string = tool.__name__
+    if remote and (name.startsWith("graph_") or name.startsWith("developer_"))
+      continue
+    server.addTool(tool)
+  server
+
+// The instructions and the tools of the MCP server, as data for the knowledge base: {instructions, tools: [{name,
+// description, schema}]}.
+mcpTools() <string, any>
+  // the MCP library turns request logs on
+  logging.getLogger("httpx").setLevel(logging.WARNING)
+  server = mcpServer()
+  tools: <string, any>[] = []
+  for tool in asyncio.run(server.listTools())
+    tools.add({ "name": tool.name, "description": tool.description ?? "", "schema": tool.inputSchema })
+  { "instructions": server.instructions ?? "", "tools": tools }
+
+// Serves MCP over stdio until the client closes it.
+mcpMain() void
+  mcpServer().run()

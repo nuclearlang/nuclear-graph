@@ -1,0 +1,400 @@
+// id, what it is, the file that says its version, how the version is written there
+COMPONENTS = [
+  ["nuclear", "the compiler, its CLI and the language server", "Cargo.toml", r'^version\s*=\s*"([^"]+)"'],
+  ["dragonfly", "the CLI of Dragonfly projects", "dragonfly/Cargo.toml", r'^version\s*=\s*"([^"]+)"'],
+  ["nuclear-graph", "the Smart Graph: the knowledge base and the MCP server", "nuclear-graph/pyproject.toml", r'^version\s*=\s*"([^"]+)"'],
+  ["nuclear-developer", "the local agents", "nuclear-developer/config.nuc", r'version = "([^"]+)"'],
+  ["nuclear-vscode", "the VS Code extension, with the Loop and `nuclear-loop`", "nuclear-vscode/package.json", r'"version":\s*"([^"]+)"'],
+  ["nuclear-jetbrains", "the JetBrains plugin (Android Studio, IntelliJ)", "nuclear-jetbrains/resources/META-INF/plugin.xml", r"<version>([^<]+)</version>"],
+  ["nuclear-zed", "the Zed extension", "nuclear-zed/extension.toml", r'^version\s*=\s*"([^"]+)"'],
+  ["dragonfly-py", "the runtime of the fastapi dialect (Python)", "dragonfly-backend/packages/dragonfly-py/pyproject.toml", r'^version\s*=\s*"([^"]+)"'],
+  ["dragonfly-nest", "the runtime of the nestjs dialect (TypeScript)", "dragonfly-backend/packages/dragonfly-nest/package.json", r'"version":\s*"([^"]+)"'],
+  ["dragonfly-dart", "the runtime of the flutter dialect (the `dragonfly` Dart package)", "dragonfly-mobile/packages/dragonfly/pubspec.yaml", r"^version:\s*(\S+)"],
+  ["dragonfly-web", "the runtime of the react dialect (TypeScript)", "dragonfly-web/packages/dragonfly-web/package.json", r'"version":\s*"([^"]+)"'],
+]
+
+// An entry of a help text: the heading it is under and its lines.
+Entry(heading: string, lines: string[])
+
+// The rows of the tools shelf that have a source: the command line tools as their help prints them, the MCP server,
+// the HTTP routes, the Loop's stages, the local agents, the editor's commands and each component's version.
+ExtractTools
+  // A help text as entries: a line at `indent` starts one, the more indented lines below belong to it.
+  static entries(text: string, indent: int = 2) Entry[]
+    out: Entry[] = []
+    heading = ""
+    for line in linesOf(text)
+      if line.trim().length == 0
+        continue
+      depth = line.length - line.trimStart().length
+      if depth < indent
+        heading = line.trim()
+      else if depth == indent
+        out.add(Entry(heading, [line]))
+      else if out.length > 0 and out.last.heading == heading
+        out.last.lines.add(line)
+    out
+
+  // The first word of a line.
+  static word(line: string) string
+    squeeze(line).split(" ")[0]
+
+  // The description of a help entry: what follows the command after two spaces (or its `(alias)`), and its
+  // continuation lines.
+  static describe(lines: string[]) string
+    first = lines[0].trim()
+    cut = Regex(r"\s{2,}|\s(?=\(\w{1,3}\)\s)").find(first)
+    words: string[] = [cut != null ? first.substring(cut!.end) : ""]
+    for line in lines.skip(1)
+      words.add(line.trim().split(Regex(r"\s{2,}")).last)
+    text = words.filter((w) => w.length > 0).join(" ").replaceAll(Regex(r"^\(\w+\)\s*"), "").trim()
+    "${text.substring(0, Math.min(1, text.length)).upper()}${text.substring(Math.min(1, text.length))}"
+
+  // A help entry as data: `what` it runs or makes (the first word after the command; `kind` for any kind of a
+  // platform), its whole command line (`usage`), its alias, the note before it ("backend and web projects") and what
+  // it does. `command`: what the help leaves out before its lines (`dragonfly make`).
+  static entryOf(lines: string[], command: string) <string, any>
+    first = lines[0].trim()
+    cut = Regex(r"\s{2,}|\s(?=\(\w{1,3}\)\s)").find(first)
+    written = cut != null ? first.substring(0, cut!.start) : first
+    note = ": <" in written ? before(written, ": <") : ""
+    usage = note.length > 0 ? after(written, ": ") : written
+    whole = usage.startsWith(command.split(" ")[0]) ? usage : "${command} ${usage}"
+    what = whole.substring(Math.min(whole.length, command.length)).trim()
+    { "what": stripChars(ExtractTools.word(what.length > 0 ? what : whole), "<>"), "usage": whole, "alias": captured(r"\((\w{1,3})\)\s", first), "note": note, "does": ExtractTools.describe(lines) }
+
+  // One command's row from its help entries (each entry is its lines).
+  static toolRow(tool: string, name: string, found: string[][], sources: string[], extra: string = "") <string, any>
+    block = found.flatten().join("\n")
+    described = found.map((entry) => ExtractTools.describe(entry)).filter((d: string) => d.length > 0).join("; ")
+    command = "${tool} ${name}".trim()
+    summary: string = clip(described, 400)
+    keys: string[] = [command.lower()]
+    if " " in name
+      keys.add(name.lower())
+    {
+      "id": name.length > 0 ? "tool:${tool}.${squeeze(name).split(" ").map((w) => slug(w)).join(".")}" : "tool:${tool}", "type": "cli",
+      "title": clip("`${command}` — ${firstSentence(described, 100)}", 140), "summary": summary.length > 0 ? summary : "The `${command}` command.",
+      "body": "```text\n${block}\n```${extra.length > 0 ? "\n\n${extra}" : ""}", "keys": keys.unique().sorted(),
+      "sources": sources, "meta": { "tool": tool, "name": name },
+      "data": { "command": command, "entries": found.filter((entry) => entry.length > 0 and entry[0].startsWith(" ")).map((entry) => ExtractTools.entryOf(entry, name.startsWith("gen ") ? "${tool} gen" : (name in ["make", "gen"] ? command : tool))) },
+    }
+
+  static push(found: <string, string[][]>, key: string, lines: string[]) void
+    if not (key in found)
+      found[key] = []
+    found[key]!.add(lines)
+
+  static cli(ctx: Context) <string, any>[]
+    rows: <string, any>[] = []
+    // nuclear: `nuclear help` lists every usage line, then the documentation topics
+    text = ctx.run(["nuclear", "help"]) ?? ""
+    if text.length > 0
+      usage = before(text, "\ndocumentation:")
+      rest = after(text, "\ndocumentation:")
+      by: <string, string[][]> = {}
+      command = Regex(r"^\s*nuclear (\w+)")
+      for entry in ExtractTools.entries(after(usage, "usage:"))
+        m = command.find(entry.lines[0])
+        ExtractTools.push(by, m != null ? m![1] ?? "options" : "options", entry.lines)
+      for name, found in by
+        if name != "options"
+          rows.add(ExtractTools.toolRow("nuclear", name, found, ["crates/nuclear-cli/src/main.rs"]))
+      topics = "documentation:${rest.split("\ndialects:")[0]}"
+      options: string[][] = by["options"] ?? []
+      rows.add({
+        "id": "tool:nuclear", "type": "cli", "title": "`nuclear` — the compiler's command line",
+        "summary": "${clip(linesOf(text)[0], 300)} Commands: ${by.keys.filter((n) => n != "options").sorted().join(", ")}.",
+        "body": "```text\n${options.flatten().join("\n")}\n```\n\nEvery command has its own row (`nuclear build`, `nuclear check`...). The documentation it prints:\n\n```text\n${topics.trim()}\n```",
+        "keys": ["nuclear cli", "nuclear command"], "sources": ["crates/nuclear-cli/src/main.rs"], "meta": { "tool": "nuclear", "name": "" },
+      })
+    // dragonfly: sections; the commands of a project each have a row, the tables (make, gen, packages) one per section
+    text = ctx.run(["dragonfly", "--help"]) ?? ""
+    if text.length > 0
+      src = ["dragonfly/dragonfly/src/main.rs"]
+      byCommand: <string, string[][]> = {}
+      sections: <string, string[][]> = {}
+      for entry in ExtractTools.entries(text)
+        heading = entry.heading
+        lines = entry.lines
+        if heading.startsWith("project") or heading.startsWith("backend") or heading.startsWith("setup")
+          ExtractTools.push(byCommand, ExtractTools.word(lines[0]), lines)
+        else if "dragonfly make" in heading
+          if not ("make" in sections)
+            sections["make"] = [[heading]]
+          sections["make"]!.add(lines)
+        else if "dragonfly gen" in heading
+          if not ("gen" in sections)
+            sections["gen"] = [[heading]]
+          sections["gen"]!.add(lines)
+          // every generator the help lists has its row (a platform's `generator:` rows link to it)
+          rows.add(ExtractTools.toolRow("dragonfly", "gen ${ExtractTools.word(lines[0])}", [lines], src))
+        else if heading.startsWith("packages")
+          if not ("packages" in sections)
+            sections["packages"] = []
+          packages: string[][] = sections["packages"]!
+          packages.add([heading] in packages ? [] : [heading])
+          packages.add(lines)
+        else if heading.startsWith("options")
+          if not ("options" in sections)
+            sections["options"] = [[heading]]
+          sections["options"]!.add(lines)
+      for name, found in byCommand
+        rows.add(ExtractTools.toolRow("dragonfly", name, found, src))
+      for name, found in sections
+        if name != "options"
+          rows.add(ExtractTools.toolRow("dragonfly", name, found.filter((e) => e.length > 0), src))
+      commands = [...byCommand.keys, ...sections.keys].filter((n) => n != "options").unique().sorted()
+      shown: string[][] = sections["options"] ?? []
+      rows.add({
+        "id": "tool:dragonfly", "type": "cli", "title": "`dragonfly` — the command line of Dragonfly projects",
+        "summary": "Creates, generates, builds, runs, tests and repairs a Dragonfly project of any platform. Commands: ${clip(commands.join(", "), 280)}.",
+        "body": "```text\n${linesOf(text)[0]}\n\n${shown.flatten().join("\n")}\n```\n\nEvery command has its own row (`dragonfly new`, `dragonfly gen resource`...).",
+        "keys": ["dragonfly cli", "dragonfly command"], "sources": src, "meta": { "tool": "dragonfly", "name": "" },
+      })
+    // nuclear-loop
+    text = ctx.run(["nuclear-loop", "help"]) ?? ""
+    if text.length > 0
+      src = ["nuclear-vscode/src/loopCli.ts"]
+      command = Regex(r"^\s*nuclear-loop (\w+)")
+      for entry in ExtractTools.entries(text)
+        m = command.find(entry.lines[0])
+        if m != null
+          rows.add(ExtractTools.toolRow("nuclear-loop", m![1] ?? "", [entry.lines], src))
+      rows.add({
+        "id": "tool:nuclear-loop", "type": "cli", "title": "`nuclear-loop` — the Nuclear Loop without the editor",
+        "summary": "Runs a spec through the pipeline (generate, plan, tests first, code, verification, security, artifacts, deploy), retries a run from any of its steps or from scratch, and exports the CI file.",
+        "body": "```text\n${text}\n```", "keys": ["nuclear-loop", "loop cli"], "sources": src, "meta": { "tool": "nuclear-loop", "name": "" },
+      })
+    // nuclear-graph: argparse prints its commands at 4 spaces
+    text = ctx.help()
+    if text.length > 0
+      src = ["nuclear-graph/cli.nuc"]
+      names: string[] = []
+      for entry in ExtractTools.entries(before(after(text, "positional arguments:"), "options:"), indent = 4)
+        name = ExtractTools.word(entry.lines[0])
+        names.add(name)
+        rows.add(ExtractTools.toolRow("nuclear-graph", name, [["nuclear-graph ${entry.lines[0].trim()}", ...entry.lines.skip(1)]], src))
+      rows.add({
+        "id": "tool:nuclear-graph", "type": "cli", "title": "`nuclear-graph` — run, fill and guard the Nuclear Smart Graph",
+        "summary": "Runs the graph's server and its MCP server, builds and checks the knowledge base, ingests it, searches it, answers the exact questions and decides which programs may read it. Commands: ${names.join(", ")}.",
+        "body": "```text\n${text}\n```", "keys": ["nuclear-graph", "graph cli"], "sources": src, "meta": { "tool": "nuclear-graph", "name": "" },
+      })
+    rows
+
+  // ---- the MCP server, the HTTP routes, the Loop's stages, the local agents ----
+
+  static mcp(ctx: Context) <string, any>[]
+    served = ctx.mcp()
+    instructions: string = textAt(served, "instructions")
+    tools: <string, any>[] = listAt(served, "tools")
+    src = ["nuclear-graph/mcp_server.nuc"]
+    source = ctx.read("nuclear-graph/mcp_server.nuc")
+    rows: <string, any>[] = []
+    for tool in tools
+      name: string = textAt(tool, "name")
+      schema = tableAt(tool, "schema")
+      required: string[] = listAt(schema, "required")
+      params: string[] = []
+      described: <string, any>[] = []
+      for p, spec in tableAt(schema, "properties")
+        fallback = " = `${json.dumps(spec.get("default"))}`"
+        params.add("- `${p}`: ${spec.get("type", "any")}${p in required ? "" : fallback}")
+        described.add({ "name": p, "type": "${spec.get("type", "any")}", "required": p in required, "default": p in required ? "" : json.dumps(spec.get("default")) })
+      doc: string = squeeze(textAt(tool, "description"))
+      rows.add({
+        "id": "mcp:${name}", "type": "mcp", "title": "`${name}` — a tool of the Nuclear MCP server", "summary": firstSentence(doc, 400),
+        "body": "${doc}${params.length > 0 ? "\n\nParameters:\n\n${params.join("\n")}" : ""}", "keys": [name.lower(), name.lower().replaceAll("_", " ")],
+        // what a tool is for is its own card's to answer, not a list of the catalogue's
+        "asks": ["what does ${name} do", "que hace ${name}"],
+        "links": [{ "rel": "part-of", "to": "mcp:server" }], "sources": src, "meta": { "tool": "mcp", "name": name },
+        "data": { "group": name.split("_")[0], "runs": ExtractTools.runs(source, name), "params": described },
+      })
+    if tools.length > 0
+      rows.add({
+        "id": "mcp:server", "type": "mcp", "title": "The Nuclear MCP server: its tools and how a client must work with them",
+        "summary": "`nuclear-graph mcp` speaks the Model Context Protocol over stdio and gives an AI client ${tools.length} tools: the Smart Graph, the compiler, the dragonfly commands, the generators, the internet and the local developer.",
+        "body": "The instructions every client receives:\n\n${instructions.trim()}\n\nIts tools: ${ticked(tools.map((t) => textAt(t, "name")))}.",
+        "keys": ["mcp", "mcp server", "nuclear mcp", "model context protocol"], "sources": src, "meta": { "tool": "mcp", "name": "server" },
+      })
+    rows
+
+  // The command line a tool of the MCP server runs, read from its own source ("" when it runs none): `dragonfly gen
+  // resource` for `generate_resource`, `nuclear check` for `nuclear_check`.
+  static runs(source: string, tool: string) string
+    words = tool.split("_")
+    method = "${words[0]}${words.skip(1).map((w) => "${w.substring(0, 1).upper()}${w.substring(1)}").join("")}"
+    body = captured("(?s)\n  ${method}\\(.*?\n((?:    [^\n]*\n)+)", source)
+    made = Regex(r'\["(gen|make)", "(\w+)"').find(body)
+    if made != null
+      return "dragonfly ${made![1]} ${made![2]}"
+    loop = Regex(r'\["nuclear-loop", "(\w+)"').find(body)
+    if loop != null
+      return "nuclear-loop ${loop![1]}"
+    defs = Regex(r'\["nuclear", "(\w+)", "(\w+)"').find(body)
+    if defs != null
+      return "nuclear ${defs![1]} ${defs![2]}"
+    asked = Regex(r"~tools\.(\w+)\(").find(body)
+    if asked == null
+      return ""
+    called = asked![1] ?? ""
+    called == "dragonfly" ? "dragonfly" : "nuclear ${called == "checkProject" ? "check" : (called == "brief" ? "spec --brief" : called)}"
+
+  static http(ctx: Context) <string, any>[]
+    rows: <string, any>[] = []
+    for route in ctx.routes()
+      verb: string = textAt(route, "verb")
+      path: string = textAt(route, "path")
+      told: string = squeeze(textAt(route, "doc"))
+      doc = told.length > 0 ? told : "${verb.upper()} ${path} of the graph."
+      scope: string = textAt(route, "scope")
+      rows.add({
+        "id": "http:graph.${verb}.${slug(path)}", "type": "http", "title": "`${verb.upper()} ${path}` — the Smart Graph's HTTP API",
+        "summary": firstSentence(doc, 400), "body": "${doc}\n\nScope: `${scope.length > 0 ? scope : "none"}`. The graph listens on `127.0.0.1:7878` only; every route but the health and the access request needs `Authorization: Bearer <token>`.",
+        "keys": ["${verb} ${path}".lower(), path.lower()], "sources": ["nuclear-graph/server.nuc"], "meta": { "tool": "graph", "name": "${verb.upper()} ${path}" },
+        "data": { "service": "graph", "verb": verb.upper(), "path": path, "scope": scope },
+      })
+    controller = ctx.read("nuclear-developer/components/developer/api/developer_controller.nuc")
+    named: string = captured(r'@controller\("([^"]+)"\)', controller)
+    prefix = named.length > 0 ? named : "developer"
+    for m in Regex(r'@(get|post|put|patch|delete)\("([^"]*)"[^)]*\)\n\s+(\w+\([^)]*\)[^\n]*)\n((?:\s{4}.*\n)+)').findAll(controller)
+      path = m[2] ?? ""
+      method = (m[3] ?? "").trim()
+      agent: string = captured(r"~(\w+)\.run", m[4] ?? "")
+      route = "${(m[1] ?? "").upper()} /${prefix}/${path}"
+      rows.add({
+        "id": "http:developer.${slug(path)}", "type": "http", "title": "`${route}` — the Nuclear Developer's HTTP API",
+        "summary": "Runs the local ${agent.length > 0 ? agent : "agent"} on one request: `${method}`. The Developer listens on `127.0.0.1:7879`.",
+        "body": "`${route}` → `${method}`.\n\nEach request runs on a thread of its own, so nothing of one request reaches the next. Start it: `nuclear-developer` (or `dragonfly run` in its folder).",
+        "keys": [route.lower(), "/${prefix}/${path}"], "links": agent.length > 0 ? [{ "rel": "runs", "to": "agent:${agent}" }] : [],
+        "sources": ["nuclear-developer/components/developer/api/developer_controller.nuc"], "meta": { "tool": "developer", "name": route },
+        "data": { "service": "developer", "verb": (m[1] ?? "").upper(), "path": "/${prefix}/${path}", "scope": "", "agent": agent },
+      })
+    rows
+
+  static stages(ctx: Context) <string, any>[]
+    found = Regex(r"\{ id: '(\w+)', title: '([^']*)', about: '((?:[^'\\]|\\.)*)', actors: \[([^\]]*)\] \}").findAll(ctx.read("nuclear-vscode/src/loopEngine.ts"))
+    rows: <string, any>[] = []
+    for at in 0..found.length
+      m = found[at]
+      sid = m[1] ?? ""
+      title = m[2] ?? ""
+      about = (m[3] ?? "").replaceAll("\\'", "'")
+      who = (m[4] ?? "").split(",").map((a) => stripChars(a, " '")).join(", ")
+      next = at + 1 < found.length ? found[at + 1][1] ?? "" : ""
+      then = " The stage after it: `${next}`."
+      rows.add({
+        "id": "stage:${sid}", "type": "stage", "title": "Stage ${at + 1} of the Loop: ${title}", "summary": firstSentence(about, 400),
+        "body": "${about}\n\nWho takes part: ${who}.${next.length > 0 ? then : " It is the last stage."}",
+        "keys": ["${title.lower()} stage", "stage ${sid}"], "links": next.length > 0 ? [{ "rel": "next", "to": "stage:${next}" }] : [],
+        "sources": ["nuclear-vscode/src/loopEngine.ts"], "meta": { "tool": "nuclear-loop", "name": sid },
+        "data": { "order": at + 1, "stage": sid, "title": title, "actors": (m[4] ?? "").split(",").map((a) => stripChars(a, " '")), "next": next },
+      })
+    rows
+
+  // The local agents of the Nuclear Developer, from their own sources: the comment above each one says what it does.
+  static agents(ctx: Context) <string, any>[]
+    rows: <string, any>[] = []
+    folder = ctx.tree.joinpath("nuclear-developer/components/developer/ai")
+    config = ctx.read("nuclear-developer/config/project_config.nuc")
+    models: <string, string> = {}
+    for m in Regex(r'Ollama\(model = env\("\w+", "([^"]+)"\)(?:, name = "(\w+)")?').findAll(config)
+      models[(m[2] ?? "").length > 0 ? m[2]! : "default"] = m[1] ?? ""
+    files: Path[] = folder.isDir() ? list(folder.glob("*.nuc")) : []
+    declared = Regex(r"((?:^//.*\n)+)(?:@.*\n)*^(graph|tools|agent) (\w+)\(", multiline = true)
+    for path in files.sorted()
+      text: string = path.readText()
+      m = declared.find(text)
+      if m == null
+        continue
+      doc = linesOf(m![1] ?? "").map((line) => line.replaceAll(Regex(r"^[/ ]+"), "").trim()).join(" ")
+      name = m![3] ?? ""
+      nodes = Regex(r'@next\("(\w+)"\)\n\s+(\w+)\(').findAll(text).map((n) => n[2] ?? "")
+      asked = Regex(r'\.ask\("(\w+)"').findAll(text).map((a) => a[1] ?? "").unique().sorted()
+      if asked.length == 0 and "bench.write" in text
+        asked = ["coder"]
+      used: string = ticked(asked.map((a) => models[a] ?? a))
+      body = "${doc}${nodes.length > 0 ? "\n\nIts steps, always in this order: ${nodes.join(" → ")}." : ""}${used.length > 0 ? "\n\nIts model: ${used} (on Ollama, at most 3B parameters)." : ""}"
+      rows.add({
+        "id": "agent:${name.lower()}", "type": "agent", "title": "${name} — a local agent of the Nuclear Developer",
+        "summary": firstSentence(doc, 400), "body": body, "keys": [name.lower(), "${name.lower()} agent"],
+        "sources": ["nuclear-developer/components/developer/ai/${path.name}"], "meta": { "tool": "developer", "name": name },
+        "data": { "kind": m![2] ?? "", "steps": nodes, "models": asked.map((a) => models[a] ?? a) },
+      })
+    rows
+
+  static editor(ctx: Context) <string, any>[]
+    raw: string = ctx.read("nuclear-vscode/package.json")
+    if raw.length == 0
+      return []
+    c = tableAt(json.loads(raw), "contributes")
+    keys: <string, string[]> = {}
+    for k in listAt(c, "keybindings")
+      command = textAt(k, "command")
+      if not (command in keys)
+        keys[command] = []
+      keys[command]!.add("${k["key"]}${"args" in k ? " (arg ${k["args"]})" : ""}")
+    lines: string[] = []
+    listed: <string, any>[] = []
+    for cmd in listAt(c, "commands")
+      command = textAt(cmd, "command")
+      bound = command in keys ? " — `${keys[command]!.join(", ")}`" : ""
+      lines.add("- ${cmd["title"]}${bound} (`${command}`)")
+      listed.add({ "title": "${cmd["title"]}", "command": command, "keys": (keys[command] ?? []).join(", ") })
+    src = ["nuclear-vscode/package.json"]
+    rows: <string, any>[] = [{
+      "id": "editor:vscode.commands", "type": "editor", "title": "VS Code: the commands of the Nuclear extension and their shortcuts",
+      "summary": "The ${lines.length} commands the Nuclear extension adds to VS Code, each with its keyboard shortcut: the workspace, run and debug, devices, the HTTP tool, the Loop, the agent's chat and the settings.",
+      "body": lines.join("\n"), "keys": ["vscode commands", "keyboard shortcuts", "shortcuts"], "sources": src, "meta": { "tool": "vscode", "name": "commands" },
+      "data": { "commands": listed },
+    }]
+    conf: any = c["configuration"] ?? []
+    parts: any[] = isinstance(conf, list) ? conf : [conf]
+    props: <string, any> = {}
+    for part in parts
+      for name, spec in tableAt(part, "properties")
+        props[name] = spec
+    groups: <string, string[]> = {}
+    settings: <string, <string, any>[]> = {}
+    for name, spec in props
+      described: string = textAt(spec, "markdownDescription")
+      text = squeeze(described.length > 0 ? described : textAt(spec, "description"))
+      group = name.startsWith("nuclear.ai.") ? "ai" : "editor"
+      if not (group in groups)
+        groups[group] = []
+      groups[group]!.add("- `${name}` (default `${json.dumps(spec.get("default"))}`): ${text}")
+      if not (group in settings)
+        settings[group] = []
+      settings[group]!.add({ "name": name, "default": json.dumps(spec.get("default")), "does": text })
+    for group, items in groups
+      what = group == "ai" ? "the AI loop, the local agents and their integrations" : "the language, the dialect, the build and the devices"
+      rows.add({
+        "id": "editor:vscode.settings.${group}", "type": "editor", "title": "VS Code: the settings of the Nuclear extension for ${what}",
+        "summary": "The ${items.length} settings of the Nuclear extension for ${what}, with their defaults.",
+        "body": items.join("\n"), "keys": ["vscode ${group} settings"], "sources": src, "meta": { "tool": "vscode", "name": "settings ${group}" },
+        "data": { "settings": settings[group] ?? [] },
+      })
+    rows
+
+  static components(ctx: Context) <string, any>[]
+    rows: <string, any>[] = []
+    known: string[][] = COMPONENTS
+    for component in known
+      name = component[0]
+      what = component[1]
+      rel = component[2]
+      version: string = captured(component[3], ctx.read(rel), multiline = true)
+      if version.length == 0
+        // a manifest that moved is found by the questions (`what version is ...`)
+        if ctx.tree.joinpath(rel).isFile()
+          ctx.problems.add("the version of `${name}` is not in ${rel} any more: correct COMPONENTS in extract_tools.nuc")
+        continue
+      rows.add({
+        "id": "component:${name}", "type": "component", "title": "`${name}` ${version} — ${what}",
+        "summary": "`${name}` is ${what}; its version is ${version}.",
+        "body": "Version ${version}, read from `${rel}`. Repository: `nuclearlang/${name.split("-py")[0].split("-nest")[0].split("-dart")[0]}`.",
+        "keys": ["${name} version"], "asks": ["what version is ${name}", "which version of ${name} is this"],
+        "sources": [rel], "meta": { "tool": name, "name": "version", "version": version },
+        "data": { "component": name, "what": what, "file": rel },
+      })
+    rows

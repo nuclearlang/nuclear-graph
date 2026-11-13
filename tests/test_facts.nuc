@@ -1,0 +1,117 @@
+use pathlib{ Path }
+
+// The exact facts (SQLite), the catalogue of exact questions and the planner of an answer.
+
+factRows() <string, <string, any>[]>
+  {
+    "tools": [
+      Testing.row("mcp:generate_resource", { "type": "mcp", "title": "generate_resource", "summary": "The finished code of a resource.", "body": "SECRET BODY", "keys": ["generate_resource", "generate resource"], "meta": { "tool": "mcp", "name": "generate_resource" }, "data": { "group": "generate", "runs": "dragonfly gen resource", "params": [{ "name": "project", "type": "string", "required": true, "default": "" }, { "name": "actions", "type": "array", "required": false, "default": "null" }] } }),
+      Testing.row("mcp:graph_search", { "type": "mcp", "title": "graph_search", "summary": "Searches the graph.", "keys": ["graph_search"], "meta": { "tool": "mcp", "name": "graph_search" }, "data": { "group": "graph", "runs": "", "params": [{ "name": "query", "type": "string", "required": true, "default": "" }] } }),
+      Testing.row("tool:dragonfly.make", { "type": "cli", "title": "dragonfly make", "summary": "Writes a file of a kind.", "keys": ["dragonfly make"], "meta": { "tool": "dragonfly", "name": "make" }, "data": { "command": "dragonfly make", "entries": [{ "what": "usecase", "usage": "dragonfly make usecase <component> <name>", "alias": "uc", "note": "", "does": "A use case" }, { "what": "model", "usage": "dragonfly make model <component> <name>", "alias": "mo", "note": "", "does": "A model" }] } }),
+    ],
+    "platforms": [
+      Testing.row("kind:backend.usecase", { "type": "kind", "title": "usecase", "summary": "One business operation.", "platforms": ["backend"], "keys": ["usecase", "use case", "caso de uso"], "asks": ["que es un caso de uso"], "meta": { "kind": "usecase", "name": "usecase" }, "data": { "platform": "backend", "file": "components/{component}/domain/usecases/{file}.nuc", "decorators": ["transactional"] } }),
+      Testing.row("kind:backend.model", { "type": "kind", "title": "model", "summary": "What the API reads and answers.", "platforms": ["backend"], "keys": ["model"], "meta": { "kind": "model", "name": "model" }, "data": { "platform": "backend", "file": "components/{component}/domain/models/{file}.nuc" } }),
+      Testing.row("platform:backend", { "type": "platform", "title": "backend", "summary": "The backend platform.", "platforms": ["backend"], "meta": { "name": "backend" }, "data": { "platform": "backend", "default_dialect": "fastapi", "dialects": ["fastapi", "nestjs"] } }),
+    ],
+    "queries": [
+      Testing.row("query:mcp.tools", { "type": "query", "title": "Exact: every tool of the MCP server", "summary": "Every tool of the MCP server.", "asks": ["what tools does the mcp offer", "que servicios ofrece el mcp"], "meta": { "entity": "mcp" }, "data": { "sql": "SELECT grp, tool, does, runs FROM mcp_tools ORDER BY grp, tool", "columns": ["group", "tool", "what it does", "command it runs"], "params": [] } }),
+      Testing.row("query:kind.create", { "type": "query", "title": "Exact: how a kind is created", "summary": "The commands that write a kind.", "asks": ["which command creates a use case", "como creo un caso de uso"], "meta": { "entity": "kind" }, "data": { "sql": "SELECT c.usage AS run, c.does AS writes FROM commands c WHERE c.what = :kind", "columns": ["run", "what it writes"], "params": [{ "name": "kind", "values": "SELECT name, kind FROM kind_names", "required": true }] } }),
+    ],
+  }
+
+testTheFactsHoldEveryNameAndFieldOfARowAndNeverItsBody() void
+  facts = Facts()
+  expect(not facts.filled() and facts.run("SELECT 1 AS one") == [])
+  counts = facts.fill(Testing.loaded(factRows()), 7)
+  expect(counts["cards"] == 8 and facts.filled())
+  // a row's body is in no table
+  expect(facts.run("SELECT count(*) AS n FROM (SELECT title AS text FROM cards UNION ALL SELECT summary FROM cards UNION ALL SELECT value FROM fields UNION ALL SELECT value FROM items) WHERE text LIKE '%SECRET BODY%'")[0]["n"] == 0)
+  expect(facts.run("SELECT value FROM about WHERE name = 'revision'")[0]["value"] == "7")
+  params = facts.run("SELECT name, type, required, fallback FROM mcp_params WHERE tool = :tool ORDER BY n", { "tool": "generate_resource" })
+  expect(params == [{ "name": "project", "type": "string", "required": "true", "fallback": "" }, { "name": "actions", "type": "array", "required": "false", "fallback": "null" }])
+  expect(facts.run("SELECT dialect, chosen FROM dialects ORDER BY dialect") == [{ "dialect": "fastapi", "chosen": "default" }, { "dialect": "nestjs", "chosen": "" }])
+  // a parameter is a value, never a piece of the query; the database is only read
+  expect(facts.run("SELECT tool FROM mcp_tools WHERE tool = :tool", { "tool": "x' OR '1'='1" }).length == 0)
+  refused = false
+  try
+    facts.run("DELETE FROM cards")
+  catch e
+    refused = true
+  expect(refused and facts.run("SELECT count(*) AS n FROM cards")[0]["n"] == 8)
+  // filled again, it holds the new rows only
+  facts.fill(Testing.loaded({ "tools": factRows()["tools"]! }), 8)
+  expect(facts.run("SELECT count(*) AS n FROM cards")[0]["n"] == 3)
+
+testABrokenQueryOfTheCatalogueIsAProblemOfTheBase() void
+  good: <string, any>[] = factRows()["queries"]!
+  none: string[] = Facts.problems(good)
+  expect(none.length == 0)
+  bad = [
+    Testing.row("query:a", { "type": "query", "data": { "sql": "SELECT nothing FROM nowhere", "params": [] } }),
+    Testing.row("query:b", { "type": "query", "data": { "sql": "SELECT tool FROM mcp_tools WHERE tool = :tool", "params": [] } }),
+    Testing.row("query:c", { "type": "query", "data": { "sql": "DROP TABLE cards", "params": [] } }),
+    Testing.row("query:d", { "type": "query", "data": { "sql": "SELECT tool FROM mcp_tools", "params": [{ "name": "unused" }] } }),
+    Testing.row("query:e", { "type": "query" }),
+  ]
+  told = Facts.problems(bad).join("\n")
+  expect("queries/query:a: the tables cannot run it" in told and "queries/query:b: the query names `:tool`" in told)
+  expect("queries/query:c: a query is one SELECT" in told and "queries/query:d: `data.params` declares `unused`" in told and "queries/query:e: no `data.sql`" in told)
+
+testAnExactQuestionIsAnsweredByItsQueryAndTheRestByTheShelves(tmpPath: Path) void
+  store = Testing.store(tmpPath)
+  facts = Facts()
+  rows = factRows()
+  facts.fill(Testing.loaded(rows), 1)
+  for shelf, held in rows
+    Testing.shelve(store, shelf, held)
+  // a list is the whole list, from the database
+  plan = Planner.answer(store, facts, "que servicios ofrece el mcp")
+  exact: <string, any>[] = plan["exact"]!
+  expect(exact.length == 1 and exact[0]["id"] == "query:mcp.tools" and exact[0]["total"] == 2)
+  expect("- generate | generate_resource | The finished code of a resource. | dragonfly gen resource" in "${plan["facts"]}")
+  // the names the question writes fill the query's parameters, also as people say them
+  made = Planner.answer(store, facts, "como creo un caso de uso")
+  runs: <string, any>[] = made["exact"]!
+  expect(runs[0]["id"] == "query:kind.create" and runs[0]["params"] == { "kind": "usecase" })
+  expect(runs[0]["rows"] == [{ "run": "dragonfly make usecase <component> <name>", "writes": "A use case" }])
+  // a follow-up takes the name it leaves out from the message before it
+  after = Planner.answer(store, facts, "which command creates it", history = "you: what is a model\nagent: what the API reads")
+  followed: <string, any>[] = after["exact"]!
+  expect(followed[0]["params"] == { "kind": "model" })
+  // without a name, the query is not run, and the answer says what it lacks
+  lacking = Planner.answer(store, facts, "which command creates it")
+  expect(lacking["exact"] == [] and "it needs kind" in "${lacking["needs"]}")
+  // a question a card answers closer than the catalogue is open, though it writes a name a query takes and is
+  // close to its exact question
+  what = Planner.answer(store, facts, "que es un caso de uso")
+  answered: <string, any>[] = what["cards"]!
+  expect(what["exact"] == [] and what["facts"] == "" and answered[0]["id"] == "kind:backend.usecase")
+  // a question with no exact answer gets the cards only; so does a graph whose facts were never filled
+  open = Planner.answer(store, facts, "one business operation")
+  cards: <string, any>[] = open["cards"]!
+  expect(open["exact"] == [] and open["facts"] == "" and cards[0]["id"] == "kind:backend.usecase")
+  expect(cards.all((item) => item["shelf"] != "queries"))
+  empty = Planner.answer(store, Facts(), "que servicios ofrece el mcp")
+  expect(empty["exact"] == [] and "${empty["knowledge"]}".length > 0)
+  // over HTTP, with a token; a graph that starts makes its facts from the cards its store holds, and writes none
+  http = Testing.http(tmpPath, store)
+  expect(http.post("/v1/answer", json = { "question": "que servicios ofrece el mcp" }).statusCode == 401)
+  told = http.post("/v1/answer", json = { "question": "que servicios ofrece el mcp" }, headers = Testing.auth()).json()
+  expect(told["exact"][0]["id"] == "query:mcp.tools" and told["exact"][0]["total"] == 2)
+  again = http.post("/v1/answer", json = { "question": "como creo un caso de uso" }, headers = Testing.auth()).json()
+  expect(again["exact"][0]["rows"] == [{ "run": "dragonfly make usecase <component> <name>", "writes": "A use case" }])
+  for file in tmpPath.rglob("*")
+    if file.isFile()
+      raw: Bytes = file.readBytes()
+      expect(not ("dragonfly make usecase".toBytes() in raw))
+
+testTheCatalogueOfThisTreeIsValid() void
+  file = Path(treeRoot()).joinpath("nuclear-developer", "data", "assets", "queries", "exact.json")
+  if file.isFile()
+    rows: <string, any>[] = Assets.readFile(file)["rows"]!
+    expect(rows.length > 30)
+    expect(Facts.problems(rows) == [])
+    for row in rows
+      asks: any[] = Assets.listOf(row["asks"])
+      expect(asks.length >= 4)

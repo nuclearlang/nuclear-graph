@@ -32,6 +32,7 @@ model, and the NuclearLang CLIs on the `PATH`.
 
 ```sh
 ollama pull embeddinggemma
+nuclear build nuclear-graph                               # the graph is written in Nuclear: its Python package
 uv tool install --editable './nuclear-graph[server]'     # nuclear-graph on the PATH
 nuclear-graph serve &                                     # the graph, on 127.0.0.1:7878
 nuclear-graph knowledge build                             # the knowledge base: nuclear-developer/data/assets
@@ -55,16 +56,40 @@ A **shelf** is a Chroma collection that answers one kind of question. A **row** 
 | `playbooks` | How is this task done, step by step, and by whom? | the strategy of each kind of request (how it is recognised, its plan, what it asks of a run); the procedure of each use case with the tool of each step; the roles and their skills |
 | `examples` | What does the code look like? | every `.nuc` of the example projects by kind and platform; solved tasks |
 | `docs` | What does the full document say? | the long form: the dialects underneath, the target languages, the runtimes, the decisions, the context files, the guides |
+| `queries` | Which, how many, what are: a question with one right answer | the catalogue of exact questions: each row is a question, its parameters and the query that answers it over the exact facts |
 
 A card has a stable id (`error:N0114`, `kind:backend.usecase`, `tool:dragonfly.gen.resource`, `concept:mcp`), a title,
 a summary, a body, the exact names it is known by (`keys`), the questions it answers (`asks`), typed links to other
 cards, the platforms it belongs to, whether the local agents read it, and the sources it was written from. The whole
-format is `nuclear_graph/shelves.py`, written into the base as `schema.json`.
+format is `shelves.nuc`, written into the base as `schema.json`.
+
+### Exact facts and the query planner
+
+A search by meaning gives the closest cards, never *all* of something: asked for every tool of the MCP server, it
+gives four cards and a model fills in the rest. So the graph also holds **the exact facts** of the base in a relational
+database (SQLite): every row's names, summary, links and structured fields (`meta`, `data`), with a view per thing a
+question can list (`commands`, `mcp_tools`, `mcp_params`, `routes`, `kinds`, `decorators`, `plugins`, `generator_pieces`,
+`diagnostics`, `library`, `stages`, `agents`, `components`, `strategies`...). The database lives in the memory of the
+graph's process only: it is made from the cards the store keeps sealed when the graph starts, and again at every
+ingest; nothing of it is written to disk, and it holds no row's body and nothing an agent kept at run time.
+
+The `queries` shelf is the catalogue: one row per question with one right answer (`query:mcp.tools`, `query:mcp.group`,
+`query:kind.create`, `query:cli.commands`, `query:diagnostic`...), with the ways people ask it, its parameters (each
+with the query that lists the words people write and the value each means: `generadores` → `generate`, `caso de uso` →
+`usecase`) and its SQL, checked at build time against the views. **The planner** (`POST /v1/answer`, `nuclear-graph
+answer "<question>"`, MCP `graph_answer`) asks no model: it matches the question to the catalogue (by meaning and by
+the names it writes), fills the parameters from the question's own words (or, for a follow-up, from the user's earlier
+messages), runs the queries, and searches the shelves for what is left. The shelves also decide whether a question is
+exact at all: a query runs only when its exact question is closer to what was asked than the closest card, so "what is
+nuclear" gets the card of the language and not the commands of the tool of that name. It answers `facts` (the rows,
+whole), `knowledge` (the cards) and `needs` (an exact question it is close to that lacks a name). The local assistant
+explains them, and the rows end its answer as they are, put there by code: a list never depends on a model.
 
 **Search** is by meaning and by exact name at once: the query is embedded once and each shelf answers its closest
 cards; the names the query writes (`N0114`, `gen resource`, `usecase`, `mcp`) are looked up in the cards' keys, so a
 code or a command reaches its card whatever the rest of the sentence says, in any language; a card is also found by
-the questions its author wrote for it. A card is read directly by its id, with a line for each card it links to.
+the questions its author wrote for it. The search is exact: the stored vector of every item a filter matches is
+compared with the query's (the store's own index is approximate and is not asked). A card is read directly by its id, with a line for each card it links to.
 
 ```sh
 nuclear-graph search "como funciona el MCP"                # every shelf
@@ -106,7 +131,8 @@ What the graph knows is one folder: `nuclear-developer/data` (its own repository
 | `nuclear-graph knowledge build` | writes the generated assets, validates the whole base and raises the revision when a row changed |
 | `nuclear-graph knowledge check` | fails when an asset is not what the tree gives now, a row is invalid, a curated row's source changed since its review, or the running graph holds another revision |
 | `nuclear-graph knowledge review [id...]` | records that curated rows still hold after their sources changed |
-| `nuclear-graph knowledge ask [word...]` | asks the running graph the questions of `questions.toml` and fails when one does not find its row |
+| `nuclear-graph knowledge ask [word...]` | asks the running graph the questions of `questions.toml` and fails when one does not find its row (`exact = true`: its exact query) |
+| `nuclear-graph knowledge examples` | compiles every ```` ```nuclear ```` block of the hand-written rows |
 | `nuclear-graph ingest` | makes the folder what the graph knows: only what changed is embedded again; what an agent wrote at run time is kept |
 
 A base is valid or it is not built: a link to a row that does not exist, a duplicated id, a diagnostic without
@@ -144,7 +170,8 @@ How it is protected:
 - every route but `/v1/health` and the access request needs a token; tokens are stored as SHA-256 hashes, compared in
   constant time, and an allowed request hands its token once;
 - documents are encrypted at rest (AES-256-GCM); the key and the owner token live in the desktop keyring
-  (`secret-tool`, libsecret), or in `0600` files of the data folder when there is no keyring;
+  (`secret-tool`, libsecret), or in `0600` files of the data folder when there is no keyring; a graph that starts
+  while its keyring is closed (a service at login) waits for it and never makes a second key or token;
 - the data folder (`$XDG_DATA_HOME/nuclear-graph`, `0700`) is opened only by the server process;
 - only `ingest` writes the shelves of the base: a client writes `memory` and `examples` and cannot plant false
   documentation.
@@ -171,6 +198,7 @@ of each client and what to do when a tool fails, is a page of the documentation:
 | Tool | What it gives |
 |---|---|
 | `graph_strategy(request, platform)` | **the first call for any request**: which kind of request it is (a whole system, one screen, a rename, a failing test...), the signs that say so, and the plan of that kind (ADR-0105) |
+| `graph_answer(question, platform)` | the exact answer of a question that has one (every command of a tool, the tools of this server and their parameters, the commands that write a kind, a diagnostic by its code...): the rows of the exact facts (SQLite), whole, then the cards the shelves answer by meaning |
 | `graph_search(query, shelf, k, platform, kind, type)` | the cards that answer a query, each with the rows it links to; `shelf`: one or several of the shelves above, or `memory` |
 | `graph_card(id)` | one card by its id (`error:N0114`, `kind:backend.usecase`, `playbook:feature-from-a-spec`) |
 | `graph_prompt(use_case)` | the validated prompt of `feature`, `refactor`, `bug`, `docs`, `diagram`, `test`, `security`, `piece`, `plan` |
@@ -185,7 +213,7 @@ of each client and what to do when a tool fails, is a page of the documentation:
 | `api_inspect(url, project, component, name)` | a public API's answer as a shape (keys, types, nested objects, a page); with a project, the files `generate_resource` would write |
 | `web_search(query, pages)`, `web_read(url)` | the internet: an API's documentation when neither the spec nor the API's answer gives the fields (SearXNG with `NUCLEAR_SEARXNG_URL`, Brave with `nuclear-graph web-key brave`, else Wikipedia) |
 | `developer_task(project, title, description, criteria, use_case)` | **the first step of every task**: the local developer does the whole task in the project (`nuclear-loop run --lead local`: plan, tests first, code, verification, security, artifacts) and answers the run's journal |
-| `developer_retry(project, run, from_stage)` | a run that failed, again from the step that failed (every step that passed is kept), or the whole of `from_stage` |
+| `developer_retry(project, run, from_stage, from_step, scratch)` | a run again: from the step that failed (every step that passed is kept), the whole of `from_stage`, from one step and every step after it (`from_step`, passed or failed), or from scratch (`scratch`); what the steps left out wrote is undone first |
 | `developer_review(project, run, notes, files)` | **the last step**: the lead's corrections, appended to `.nuclear/loop/runs/<run>.review.md`; each corrected file (once the project's check is `ok`) goes to the graph's `examples` |
 | `developer_code`, `developer_test`, `developer_security` | the [Nuclear Developer](https://github.com/nuclearlang/nuclear-developer): one file written, checked and repaired by the local 3B model (`platform`: backend, mobile or web; it writes only Nuclear) |
 
@@ -207,6 +235,7 @@ All routes need `Authorization: Bearer <token>` except `GET /v1/health`, `POST /
 |---|---|---|
 | `POST /v1/search` | read | `{query, collection \| shelves, k = 5, platform, agents, where, expand}` → `{items: [{id, shelf, text, meta, distance, score, via, card, related}]}`; without a collection, every shelf of the base; `where` filters by metadata (`{"type": "kind"}`, `{"kinds": "usecase"}`) |
 | `GET /v1/cards/{id}` | read | one card by its id, with the title and summary of the rows it links to |
+| `POST /v1/answer` | read | `{question, platform, history, agents, k}` → `{exact, needs, cards, facts, knowledge}`: what a question needs before a model answers it. `exact`: the exact queries it is, each with its parameters and its rows; `needs`: the ones it is close to that lack a name; `cards`: the shelves' answer by meaning; `facts` and `knowledge`: both as the text a prompt gets. No model is asked |
 | `POST /v1/strategy` | read | `{text, platform, existing, new, runnable, only}` → the strategies that fit a request, best first (at most three): `{id, title, summary, score, why, data, text}`. `existing` and `new`: the declarations the request names that a project has, and the ones it has not; `runnable`: for a run of the Loop; `only`: the strategy the request itself names |
 | `POST /v1/applies` | read | `{text, platform}` → the capabilities rows whose trigger words a spec writes: what the platform cannot do yet, limits, parts never run for real (exact, never by meaning) |
 | `GET /v1/kinds/{platform}` | read | every way a kind of the platform is written (`use case`, `application component`) and the kind it means |
@@ -255,16 +284,23 @@ files.renamed("Book", "Title")                      # a rename by a tool: every 
 
 ## Development
 
+The graph is written in Nuclear (the `python` dialect): the `.nuc` files of this folder are the source, and
+`nuclear build .` writes the Python package `build/nuclear_graph` that `pyproject.toml` packages (`[project] package`
+of `nuclear.toml` names it). `build/` is never edited and never committed.
+
 ```sh
+nuclear check . && nuclear build .          # the .nuc files → build/nuclear_graph
 uv sync --extra server --extra test
-.venv/bin/python -m pytest -q               # access, encryption at rest, the search, the knowledge base's build and check
-.venv/bin/python tests/check_examples.py    # every ```nuclear block of the hand-written rows compiles
+.venv/bin/python -m pytest -q               # tests/*.nuc: access, encryption at rest, the search, the exact facts, the planner, the knowledge base's build and check
+nuclear-graph knowledge examples            # every ```nuclear block of the hand-written rows compiles
 ```
 
-Layout: `src/nuclear_graph/` — `shelves.py` (the schema), `assets.py` (a row: validation, what is embedded, what is
-stored), `extract.py` (the generated rows), `knowledge.py` (build, check, review), `store.py` (Chroma + encryption +
-embeddings), `retrieve.py` (the search), `ingest.py`, `access.py`, `server.py`, `mcp_server.py`, `client.py`,
-`toolchain.py`, `workspace.py` (a project's files for an agent), `web.py`, `secrets_store.py`, `prompts/` (the prompt files, ingested into `prompts`), `cli.py`.
+Layout: `shelves.nuc` (the schema), `assets.nuc` (a row: validation, what is embedded, what is stored),
+`extract*.nuc` (the generated rows), `knowledge.nuc` (build, check, review), `store.nuc` (Chroma + encryption +
+embeddings), `retrieve.nuc` (the search), `facts.nuc` (the exact facts: the tables and their views), `planner.nuc`
+(the query planner), `ingest.nuc`, `access.nuc`, `server.nuc`, `mcp_server.nuc`, `client.nuc`, `toolchain.nuc`,
+`workspace.nuc` (a project's files for an agent), `web.nuc`, `secrets_store.nuc`, `crypto.nuc`, `paths.nuc`,
+`cli.nuc`, `prompts/` (the prompt files, ingested into `prompts`), `tests/`.
 
 ## License
 

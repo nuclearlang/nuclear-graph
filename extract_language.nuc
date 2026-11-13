@@ -1,0 +1,163 @@
+FAMILY = { "lexer": "syntax", "parser": "syntax", "resolver": "resolver", "dialects": "dialect", "projects and architecture": "project" }
+HABIT_WORDS = ["function", "return", "const", "let", "var", "final", "new", "await", "async", "class", "extends", "implements", "interface", "enum", "switch", "import", "this", "contains", "includes", "pow", "try"]
+GIVES = {
+  "Str": "string", "StrOpt": "string?", "Int": "int", "IntOpt": "int?", "Double": "double", "DoubleOpt": "double?",
+  "Bool": "boolean", "Void": "void", "Same": "the same type", "Elem": "the element", "ElemOpt": "the element, or null",
+  "ListElem": "a list of the elements", "ListStr": "string[]", "ListInt": "int[]", "ListAny": "a list", "Keys": "the keys",
+  "Values": "the values", "GroupMap": "a map of lists", "Num": "a number", "MatchOpt": "Match?", "ListMatch": "Match[]",
+  "DateTime": "DateTime", "DateTimeOpt": "DateTime?", "Duration": "Duration", "Bytes": "Bytes", "Regex": "Regex",
+  "SetAny": "Set", "Error": "Error", "Any": "any",
+}
+
+// The rows of the errors shelf that have a source: the compiler's diagnostics and the habits it corrects.
+ExtractErrors
+  // spec/diagnostics.md: code → {stage, what, example, fix}.
+  static documented(spec: string) <string, <string, string>>
+    out: <string, <string, string>> = {}
+    stage = ""
+    row = Regex(r"^\| N\d{4} ")
+    for line in linesOf(spec)
+      if line.startsWith("## ")
+        stage = line.substring(3).trim().lower()
+      else if row.test(line)
+        c = cells(line)
+        out[c[0]] = { "stage": stage, "what": c.length > 1 ? c[1] : "", "example": c.length > 2 ? c[2] : "", "fix": c.length > 3 ? c[3] : "" }
+    out
+
+  static diagnostics(ctx: Context) <string, any>[]
+    spec = ExtractErrors.documented(ctx.read("spec/diagnostics.md"))
+    families: <string, string> = FAMILY
+    rows: <string, any>[] = []
+    code = Regex(r'pub const (\w+): Code = Code \{\s*id: "(N\d{4})",\s*title: "((?:[^"\\]|\\.)*)",\s*explanation:\s*"((?:[^"\\]|\\.)*)",?\s*\};')
+    for m in code.findAll(ctx.read("crates/nuclear-diag/src/lib.rs"))
+      id = m[2] ?? ""
+      doc = spec[id]
+      if doc == null
+        ctx.problems.add("${id} (${m[1]}) is not documented in spec/diagnostics.md")
+        continue
+      title: string = rustText(m[3] ?? "")
+      why: string = rustText(m[4] ?? "")
+      what: string = doc!["what"]!
+      stage: string = doc!["stage"]!
+      severity = "(warning)" in what ? "warning" : "error"
+      body = ["`${id}` · ${stage} · ${severity}", "", "**What it is.** ${what}", "", "**Why.** ${why}"]
+      example: string = doc!["example"]!
+      if example != "" and example != "—"
+        body.addAll(["", "**Example.** ${example}"])
+      fix: string = doc!["fix"]!
+      if fix != "" and fix != "—"
+        body.addAll(["", "**Fix.** ${fix}"])
+      rows.add({
+        "id": "error:${id}", "type": "diagnostic", "title": "${id} — ${title}", "summary": clip(plain(what), 400),
+        "body": body.join("\n"), "keys": [id.lower(), title.lower()],
+        "sources": ["spec/diagnostics.md", "crates/nuclear-diag/src/lib.rs"],
+        "meta": { "code": id, "family": families[stage] ?? stage, "severity": severity },
+        "data": { "stage": stage, "title": title, "what": plain(what), "fix": fix == "—" ? "" : plain(fix), "example": example == "—" ? "" : example },
+      })
+    rows
+
+  // A note of the table as a sentence of its own.
+  static sentence(note: string, text: string) string
+    note.length > 0 ? " ${note.substring(0, 1).upper()}${text}." : ""
+
+  // The table "Rules that change" of the base brief: what someone who knows another language writes by reflex.
+  static habits(ctx: Context) <string, any>[]
+    rows: <string, any>[] = []
+    table = false
+    for line in linesOf(ctx.read("spec/brief/nuclear-base.md"))
+      if line.startsWith("| You would write")
+        table = true
+      else if table and line.startsWith("|") and not line.startsWith("|---")
+        c = [...cells(line), "", ""]
+        wrong = c[0]
+        right = c[1]
+        note = c[2]
+        words: string[] = []
+        for quoted in Regex(r"`([^`]+)`").findAll(wrong)
+          for word in Regex(r"[A-Za-z]{3,}").findAll(quoted[1] ?? "")
+            if word.text.lower() in HABIT_WORDS
+              words.add(word.text.lower())
+        body = [
+          "Someone who knows TypeScript, Dart or Python writes ${wrong}.", "",
+          "In Nuclear: ${right}.${ExtractErrors.sentence(note, note.substring(Math.min(1, note.length)))}",
+          "", "When the compiler sees the habit it reports `N0022` with the Nuclear form, and `nuclear fix` applies the exact ones.",
+        ]
+        rows.add({
+          "id": "habit:${slug(wrong, 48).length > 3 ? slug(wrong, 48) : slug(right, 48)}", "type": "habit",
+          "title": clip("Not ${plain(wrong)} — in Nuclear: ${plain(right)}", 140),
+          "summary": clip("In Nuclear write ${plain(right)} instead of ${plain(wrong)}.${ExtractErrors.sentence(note, plain(note.substring(Math.min(1, note.length))))}", 400),
+          "body": body.join("\n"), "keys": words.unique().sorted(), "links": [{ "rel": "reported-as", "to": "error:N0022" }],
+          "sources": ["spec/brief/nuclear-base.md#Rules that change"], "meta": { "family": "habit", "code": "N0022" },
+          "data": { "wrong": plain(wrong), "right": plain(right), "note": plain(note) },
+        })
+      else if table and not line.startsWith("|")
+        break
+    rows
+
+// One member of a base type: its name, whether it is a property, and what it gives.
+Member(name: string, property: boolean, gives: string)
+
+// A name of another language and the Nuclear one.
+Wrong(name: string, fix: string)
+
+// The rows of the language shelf that have a source: the standard library, read from the compiler's own table.
+ExtractLibrary
+  static block(src: string, name: string) string
+    captured("(?s)pub const ${name}: [^=]*= &\\[(.*?)\\n\\];", src)
+
+  static put(found: <string, Wrong[]>, base: string, wrong: Wrong) void
+    if not (base in found)
+      found[base] = []
+    found[base]!.add(wrong)
+
+  static library(ctx: Context) <string, any>[]
+    src = ctx.read("crates/nuclear-dialect/src/library.rs")
+    gives: <string, string> = GIVES
+    members: <string, Member[]> = {}
+    for m in Regex(r'\b([pm])\("(\w+)", "(\w+)", (\w+)\)').findAll(ExtractLibrary.block(src, "MEMBERS"))
+      base = m[2] ?? ""
+      if not (base in members)
+        members[base] = []
+      members[base]!.add(Member(m[3] ?? "", m[1] == "p", gives[m[4] ?? ""] ?? (m[4] ?? "")))
+    wrong: <string, Wrong[]> = {}
+    for m in Regex(r'\("([\w*]+)", "(\w+)", "([^"]*)"\)').findAll(ExtractLibrary.block(src, "WRONG"))
+      ExtractLibrary.put(wrong, m[1] == "*" ? "any" : m[1] ?? "", Wrong(m[2] ?? "", m[3] ?? ""))
+    for m in Regex(r'\("(\w+)", "(\w+)", "([^"]*)"\)').findAll(ExtractLibrary.block(src, "WRONG_STATIC"))
+      owner = m[1] ?? ""
+      ExtractLibrary.put(wrong, owner in members ? owner : "functions", Wrong("${owner}.${m[2]}", m[3] ?? ""))
+    for m in Regex(r'\("(\w+)", "([^"]*)"\)').findAll(ExtractLibrary.block(src, "WRONG_FUNCTIONS"))
+      ExtractLibrary.put(wrong, "functions", Wrong("${m[1]}(x)", m[2] ?? ""))
+    own: string[] = ["int", "double", "number", "string", "boolean"]
+    for base, held in members
+      own.add(base.lower())
+      for member in held
+        own.add(member.name.lower())
+    rows: <string, any>[] = []
+    for base in [...members.keys, ...wrong.keys].unique().sorted()
+      mine: Member[] = members[base] ?? []
+      bad: Wrong[] = wrong[base] ?? []
+      props = mine.filter((x) => x.property).map((x) => "`${x.name}` → ${x.gives}")
+      methods = mine.filter((x) => not x.property).map((x) => "`${x.name}()` → ${x.gives}")
+      body: string[] = []
+      if props.length > 0
+        body.addAll(["Properties (written without parentheses): ${props.join(", ")}.", ""])
+      if methods.length > 0
+        body.addAll(["Methods: ${methods.join(", ")}.", ""])
+      if bad.length > 0
+        body.addAll(["Names of other languages and the Nuclear one (the compiler reports them as `N0114` with this fix):", ""])
+        body.addAll(bad.map((x) => "- `${x.name}` → `${x.fix}`"))
+      what = base == "functions" ? "functions and statics of other languages" : "`${base}`"
+      summary = base == "functions" ? "The functions and statics of other languages (`len`, `str`, `console.log`...) and what Nuclear writes instead." : "The members of ${what} in Nuclear's standard library, the same in every dialect: ${clip(mine.map((x) => x.name).join(", "), 260)}."
+      keys: string[] = ["${base.lower()} members"]
+      for x in bad
+        key = x.name.replaceAll(Regex(r"\W.*"), "").lower()
+        if not ("." in x.name) and not (key in own)
+          keys.add(key)
+      rows.add({
+        "id": "lib:${base}", "type": "library", "title": "${what} — Nuclear's standard library", "summary": summary,
+        "body": body.join("\n").trim(), "keys": keys.unique().sorted(),
+        "links": bad.length > 0 ? [{ "rel": "wrong-name-is", "to": "error:N0114" }] : [],
+        "sources": ["crates/nuclear-dialect/src/library.rs", "spec/library.md"], "meta": { "base": base },
+        "data": { "members": mine.map((x) => { "name": x.name, "property": x.property, "gives": x.gives }), "wrong": bad.map((x) => { "name": x.name, "fix": x.fix }) },
+      })
+    rows

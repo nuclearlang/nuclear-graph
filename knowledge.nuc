@@ -1,0 +1,288 @@
+use datetime
+use hashlib
+use tomllib
+use pathlib{ Path }
+
+MANIFEST = "manifest.json"
+REVISIONS = "revisions.json"
+SCHEMA_FILE = "schema.json"
+INDEX = "INDEX.md"
+// an overlay adds to these; it replaces the rest
+MERGED = ["keys", "asks", "tags", "links", "sources", "platforms"]
+
+// The knowledge base as a folder (the `nuclear-knowledge` repository, `nuclear-developer/data`; ADR-0104): the asset
+// files the Smart Graph ingests, their schema and their version.
+//
+// - `assets/<shelf>/<name>.json` with `"origin": "generated"`: written here from the working tree (the `Extract*`
+//   modules); never edited by hand. `<name>.overlay.json` beside one adds hand-written fields to its rows (links,
+//   examples, questions).
+// - `assets/<shelf>/<name>.json` with `"origin": "curated"`: written by hand (the purpose, the concepts, the
+//   playbooks, the capabilities, the failures). Each row names the `sources` it was written from.
+// - `manifest.json`: the schema, the revision and every row with its hash and the revision that last changed it; for
+//   a curated row, the hash of each of its sources when it was last reviewed.
+//
+// `build` writes what is generated, validates everything and raises the revision when a row changed. `check` fails
+// when the assets are not what the tree generates now, when a row is invalid, or when a source of a curated row
+// changed since its review: the base is never left behind the code.
+Knowledge
+  // What the extraction reads for the base `out` of the tree `tree`: its `sections.toml`, the website it names, and
+  // what the caller gives of this machine (the MCP server's tools, the command line's help, the HTTP routes).
+  static context(tree: Path, out: Path, mcp: () => <string, any>, help: () => string, routes: () => <string, any>[]) Context
+    file = out.joinpath("sections.toml")
+    sections: <string, any> = file.isFile() ? tomllib.loads(file.readText()) : {}
+    site: string = textAt(sections, "website")
+    website: Path? = null
+    if site.length > 0 and Path(site).expanduser().isDir()
+      website = Path(site).expanduser()
+    Context(tree = tree, mcp = mcp, help = help, routes = routes, website = website, sections = sections)
+
+  // The generated rows with the hand-written fields of `<name>.overlay.json` merged in by id.
+  static overlaid(name: string, rows: <string, any>[], out: Path, problems: string[]) <string, any>[]
+    file = out.joinpath("assets", "${name}.overlay.json")
+    if not file.isFile()
+      return rows
+    byId: <string, <string, any>> = {}
+    for r in rows
+      byId["${r["id"]}"] = { ...r }
+    extras: <string, any>[] = Assets.readFile(file)["rows"]!
+    for extra in extras
+      found = byId["${extra["id"]}"]
+      if found == null
+        problems.add("assets/${name}.overlay.json: `${extra["id"]}` is not a row of ${name}.json any more")
+        continue
+      row: <string, any> = found!
+      for key, value in extra
+        if key == "add"
+          // more body, after the generated one
+          row["body"] = "${Assets.textOf(row["body"]).trim()}\n\n${Assets.textOf(value).trim()}"
+        else if key in MERGED
+          have: any[] = row[key] ?? []
+          more: any[] = value
+          row[key] = [...have, ...more.filter((v) => not (v in have))]
+        else if key == "meta"
+          row["meta"] = { ...Assets.mapOf(row["meta"]), ...Assets.mapOf(value) }
+        else if key != "id"
+          row[key] = value
+    byId.values
+
+  // Every generated file as the tree gives it now (overlays merged), and what the extraction found wrong: the files
+  // are `<shelf>/<name>` → [what it holds, its rows]; the problems are added to `problems`.
+  static generated(out: Path, ctx: Context, problems: string[]) <string, any[]>
+    files: <string, any[]> = generateAssets(ctx)
+    problems.addAll(ctx.problems)
+    merged: <string, any[]> = {}
+    for name, value in files
+      merged[name] = [value[0], Knowledge.overlaid(name, value[1], out, problems)]
+    merged
+
+  // The asset files of one origin as they are written now: `<shelf>/<name>` → the file.
+  static filesOf(out: Path, origin: string) <string, <string, any>>
+    found: <string, <string, any>> = {}
+    paths: Path[] = list(out.joinpath("assets").glob("*/*.json"))
+    for path in paths.sorted()
+      name: string = path.name
+      if name.endsWith(".overlay.json")
+        continue
+      data: <string, any> = Assets.readFile(path)
+      if "${data["origin"] ?? "curated"}" == origin
+        found["${path.parent.name}/${path.stem}"] = data
+    found
+
+  // The hash of a source of a curated row: a file, or one heading's section of it (`file#Heading`).
+  static sourceHash(ctx: Context, source: string) string
+    rel: string = before(source, "#")
+    heading: string = after(source, "#")
+    path = rel.startsWith("website/") and ctx.website != null ? ctx.website!.joinpath(rel.substring(8)) : ctx.tree.joinpath(rel)
+    if not path.isFile()
+      return "missing"
+    text: string = path.readText(errors = "replace")
+    if heading.length > 0
+      escaped: string = re.escape(heading)
+      m = Regex("^(#+) ${escaped}\\s*$", multiline = true).find(text)
+      if m == null
+        return "missing"
+      rest: string = text.substring(m!.end)
+      end = Regex("^#{1,${(m![1] ?? "").length}} ", multiline = true).find(rest)
+      text = end != null ? rest.substring(0, end!.start) : rest
+    hashlib.sha1(text.toBytes()).hexdigest().substring(0, 12)
+
+  // shelf → rows, from `<shelf>/<name>` → [about, rows] (a generated file) or a file's data (one written by hand).
+  static rowsOf(files: <string, any>) <string, <string, any>[]>
+    out: <string, <string, any>[]> = {}
+    for name, value in files
+      shelf = name.split("/")[0]
+      if not (shelf in out)
+        out[shelf] = []
+      rows: <string, any>[] = isinstance(value, list) ? value[1] : value["rows"]
+      out[shelf]!.addAll(rows)
+    out
+
+  static readManifest(out: Path) <string, any>
+    try
+      json.loads(out.joinpath(MANIFEST).readText())
+    catch e
+      { "schema": schemaVersion(), "revision": 0, "rows": {}, "reviewed": {} }
+
+  static block(items: <string, any>) string[]
+    lines = items.keys.sorted().map((k) => "  ${json.dumps(k)}: ${json.dumps(items[k], sortKeys = true)},")
+    if lines.length == 0
+      return lines
+    closing: string = lines.removeLast()
+    lines.add(closing.substring(0, closing.length - 1))
+    lines
+
+  // One row per line: a diff of the manifest shows the rows that changed.
+  static writeManifest(out: Path, manifest: <string, any>) void
+    lines = [
+      "{", " \"schema\": ${manifest["schema"]},", " \"revision\": ${manifest["revision"]},", " \"rows\": {", ...Knowledge.block(manifest["rows"]!),
+      " },", " \"reviewed\": {", ...Knowledge.block(manifest["reviewed"]!), " }", "}",
+    ]
+    out.joinpath(MANIFEST).writeText("${lines.join("\n")}\n")
+
+  static indexMd(byShelf: <string, <string, any>[]>, revision: int) string
+    lines = ["# The knowledge base of NuclearLang", "", "Schema ${schemaVersion()}, revision ${revision}. Generated by `nuclear-graph knowledge build`: the shelves of the Smart Graph, what each one answers and its rows. The row format is in `schema.json`.", ""]
+    known: <string, Shelf> = shelfTable()
+    for name, shelf in known
+      held: <string, any>[] = byShelf[name] ?? []
+      rows = held.sortedBy((r) => "${r["id"]}")
+      byType: <string, int> = {}
+      for r in rows
+        type = "${r["type"]}"
+        byType[type] = (byType[type] ?? 0) + 1
+      counts = byType.keys.sorted().map((t) => "${byType[t]} ${t}").join(", ")
+      lines.addAll(["## ${name} — ${shelf.answers}", "", shelf.holds, "", "${rows.length} rows: ${counts}.", ""])
+      if not (name in ["docs", "examples"]) and rows.length <= 400
+        lines.addAll(rows.map((r) => "- `${r["id"]}` — ${r["title"]}"))
+        lines.add("")
+    lines.join("\n")
+
+  // The short hash of every row: id → [shelf, hash].
+  static hashesOf(byShelf: <string, <string, any>[]>) <string, any[]>
+    out: <string, any[]> = {}
+    for shelf, rows in byShelf
+      for r in rows
+        out["${r["id"]}"] = [shelf, Assets.rowHash(r).substring(0, 12)]
+    out
+
+  // Writes the generated assets, validates the whole base and raises the revision when a row changed. With a
+  // problem nothing is versioned: fix it and build again.
+  static build(out: Path, ctx: Context, today: string = "") <string, any>
+    problems: string[] = []
+    files: <string, any[]> = Knowledge.generated(out, ctx, problems)
+    for name, value in files
+      Assets.writeFile(out.joinpath("assets", "${name}.json"), name.split("/")[0], "generated", "${value[0]}", value[1], after(name, "/"))
+    // a generated file the tree no longer gives
+    onDisk: <string, <string, any>> = Knowledge.filesOf(out, "generated")
+    for name in onDisk.keys
+      if not (name in files)
+        out.joinpath("assets", "${name}.json").unlink()
+    hand: <string, <string, any>> = Knowledge.filesOf(out, "curated")
+    byShelf: <string, <string, any>[]> = Knowledge.rowsOf({ ...files, ...hand })
+    problems.addAll(Assets.problems(byShelf))
+    problems.addAll(Facts.problems(byShelf[exactShelf()] ?? []))
+    if problems.length > 0
+      return { "problems": problems, "rows": byShelf.values.map((r) => r.length).sum() }
+    old = Knowledge.readManifest(out)
+    oldRows: <string, any> = old["rows"]!
+    hashes: <string, any[]> = Knowledge.hashesOf(byShelf)
+    changed = hashes.keys.filter((i) => i in oldRows and oldRows[i]![1] != hashes[i]![1]).sorted()
+    added = hashes.keys.filter((i) => not (i in oldRows)).sorted()
+    removed = oldRows.keys.filter((i) => not (i in hashes)).sorted()
+    was: int = old["revision"]!
+    moved = changed.length > 0 or added.length > 0 or removed.length > 0 or old["schema"] != schemaVersion()
+    revision = was + (moved ? 1 : 0)
+    touched = [...changed, ...added]
+    rows: <string, any> = {}
+    for i, value in hashes
+      rows[i] = [value[0], value[1], i in touched ? revision : oldRows[i]![2]]
+    reviewed: <string, any> = {}
+    manifest: <string, any> = { "schema": schemaVersion(), "revision": revision, "reviewed": reviewed, "rows": rows }
+    // a curated row is reviewed when it is written or changed; an unchanged one keeps the hashes of its last review
+    oldReviewed: <string, any> = old["reviewed"]!
+    for data in hand.values
+      curated: <string, any>[] = data["rows"]!
+      for r in curated
+        sources: string[] = r["sources"] ?? []
+        if sources.length > 0
+          rid = "${r["id"]}"
+          kept = rid in touched ? null : oldReviewed[rid]
+          now: <string, string> = {}
+          for s in sources
+            now[s] = Knowledge.sourceHash(ctx, s)
+          reviewed[rid] = kept ?? now
+    if revision != was
+      file = out.joinpath(REVISIONS)
+      log: any[] = file.isFile() ? json.loads(file.readText()) : []
+      both = [...added, ...changed, ...removed]
+      named = both.take(40)
+      if both.length > 40
+        named.add("… and ${both.length - 40} more")
+      log.add({ "revision": revision, "date": today.length > 0 ? today : datetime.date.today().isoformat(), "added": added.length, "changed": changed.length, "removed": removed.length, "rows": named })
+      file.writeText("${json.dumps(log, indent = 1)}\n")
+    if manifest != old
+      Knowledge.writeManifest(out, manifest)
+    out.joinpath(SCHEMA_FILE).writeText("${json.dumps(graphSchema(), indent = 1)}\n")
+    out.joinpath(INDEX).writeText(Knowledge.indexMd(byShelf, revision))
+    sizes: <string, int> = {}
+    for shelf, held in byShelf
+      sizes[shelf] = held.length
+    { "problems": [], "rows": hashes.length, "revision": revision, "added": added.length, "changed": changed.length, "removed": removed.length, "shelves": sizes, "review": Knowledge.stale(ctx, manifest) }
+
+  // The curated rows whose source changed since their last review.
+  static stale(ctx: Context, manifest: <string, any>) string[]
+    out: string[] = []
+    reviewed: <string, any> = manifest["reviewed"] ?? {}
+    for rid in reviewed.keys.sorted()
+      sources: <string, any> = reviewed[rid]!
+      for source, was in sources
+        if Knowledge.sourceHash(ctx, source) != was
+          out.add("review: `${rid}` was written from ${source}, which changed: update the row, or confirm it still holds with `nuclear-graph knowledge review ${rid}`")
+    out
+
+  // Every way the base is behind the tree: a generated file that is not what the tree gives now, an invalid row, a
+  // manifest of other rows, a curated row whose source changed.
+  static check(out: Path, ctx: Context) string[]
+    problems: string[] = []
+    files: <string, any[]> = Knowledge.generated(out, ctx, problems)
+    disk: <string, <string, any>> = Knowledge.filesOf(out, "generated")
+    for name, value in files
+      held: <string, any>[] = (disk[name] ?? { "rows": [] })["rows"]!
+      wanted: <string, any>[] = value[1]
+      have: <string, string> = {}
+      for r in held
+        have["${r["id"]}"] = Assets.rowHash(r)
+      want: <string, string> = {}
+      for r in wanted
+        want["${r["id"]}"] = Assets.rowHash(r)
+      if have != want
+        diff = [...have.keys, ...want.keys].unique().filter((i) => have[i] != want[i]).sorted()
+        problems.add("stale: assets/${name}.json is not what the tree gives now (${diff.length} rows: ${diff.take(4).join(", ")}${diff.length > 4 ? "…" : ""}): `nuclear-graph knowledge build`")
+    for name in disk.keys.filter((n) => not (n in files)).sorted()
+      problems.add("extra: assets/${name}.json is generated from nothing now: `nuclear-graph knowledge build`")
+    byShelf: <string, <string, any>[]> = Knowledge.rowsOf({ ...files, ...Knowledge.filesOf(out, "curated") })
+    problems.addAll(Assets.problems(byShelf))
+    problems.addAll(Facts.problems(byShelf[exactShelf()] ?? []))
+    manifest = Knowledge.readManifest(out)
+    recorded: <string, any[]> = {}
+    rows: <string, any> = manifest["rows"]!
+    for i, value in rows
+      recorded[i] = [value[0], value[1]]
+    if recorded != Knowledge.hashesOf(byShelf)
+      problems.add("${MANIFEST} is not the one of these rows (a curated row changed, or it was never built): `nuclear-graph knowledge build`")
+    [...problems, ...Knowledge.stale(ctx, manifest)]
+
+  // Records that the curated rows `ids` (every stale one when empty) still hold with their sources as they are.
+  static review(out: Path, ids: string[], ctx: Context) string[]
+    manifest = Knowledge.readManifest(out)
+    reviewed: <string, any> = manifest["reviewed"]!
+    done: string[] = []
+    for rid in reviewed.keys
+      sources: <string, any> = reviewed[rid]!
+      now: <string, any> = {}
+      for s in sources.keys
+        now[s] = Knowledge.sourceHash(ctx, s)
+      if now != sources and (ids.length == 0 or rid in ids)
+        reviewed[rid] = now
+        done.add(rid)
+    Knowledge.writeManifest(out, manifest)
+    done

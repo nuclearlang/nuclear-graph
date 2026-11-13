@@ -1,0 +1,12 @@
+# The Nuclear Smart Graph is written in Nuclear and built with the `python` dialect: `nuclear build .` writes the
+# Python package `build/nuclear_graph`, which `pyproject.toml` packages. Never edit `build/`: change the `.nuc` files.
+[project]
+name = "nuclear_graph"
+dialect = "python"
+package = "nuclear_graph"
+version = "0.2.0"
+description = "Nuclear Smart Graph: the local, private knowledge base of NuclearLang and Dragonfly (shelves of cards and a table of exact facts), and their MCP server."
+out = "build"
+
+[dependencies]
+httpx = ">=0.28"
