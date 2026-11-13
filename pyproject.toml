@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "Nuclear Smart Graph: the local, private knowledge base (RAG) of NuclearLang and Dragonfly, and their MCP server."
 license = "Apache-2.0"
 requires-python = ">=3.12"
-# the client and the tools for agents need only httpx; the graph's server, store and MCP are the `server` extra
+# the client and the tools for agents need only httpx; the MCP server alone (remote agents only, ADR-0106) is the
+# `mcp` extra; the graph's server, its store and the MCP server are the `server` extra
 dependencies = ["httpx>=0.28"]
 
 [project.optional-dependencies]
+mcp = ["mcp>=2.3"]
 server = ["chromadb>=1.5", "ollama>=0.6", "fastapi>=0.115", "uvicorn>=0.30", "cryptography>=44", "mcp>=2.3"]
 test = ["pytest>=8"]
 

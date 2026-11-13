@@ -8,7 +8,9 @@ never shows an empty heading. `{{guide}}` is the validated guide of the use case
 |---|---|---|
 | `piece.md` | coder and tester · write | coder |
 | `repair.md` | coder and tester · repair with the compiler's errors | coder |
+| `faithful.md` | coder · the answer compiles but lacks a name, a path or a value the task writes | coder |
 | `test.md` | tester · what it answers | coder |
+| `analyze.md` | analyst · the resources a request in plain words describes (each line is then tried with the generator's dry run) | default |
 | `plan.md` | planner · split the spec | default |
 | `plan-again.md` | planner · the answer had no line in the form | default |
 | `security.md` | security reviewer · review | default |

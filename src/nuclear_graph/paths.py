@@ -20,6 +20,17 @@ def home() -> Path:
     return root
 
 
+def machine() -> dict[str, str]:
+    """What the AI set-up chose on this machine (ADR-0106): the `KEY=value` lines of nuclearlang/ai.env, written by
+    `nuclear-loop setup` and the editor (the mode, the profile and its models)."""
+    base = Path(os.environ.get("APPDATA") or Path.home()) if os.name == "nt" else Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    try:
+        lines = (base / "nuclearlang" / "ai.env").read_text().splitlines()
+    except OSError:
+        return {}
+    return dict(line.split("=", 1) for line in lines if "=" in line and not line.startswith("#"))
+
+
 def db() -> Path:
     return home() / "db"
 

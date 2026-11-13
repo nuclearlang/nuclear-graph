@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 from mcp.server.mcpserver import MCPServer
 
+from . import paths
 from .client import GraphClient
 from .toolchain import Toolchain, _run
 from .web import Web, public
@@ -20,42 +21,89 @@ from .web import Web, public
 DEVELOPER_URL = os.environ.get("NUCLEAR_DEVELOPER_URL", "http://127.0.0.1:7879")
 DRAGONFLY_COMMANDS = {"new", "n", "build", "install", "test", "check", "analyze", "make", "g", "gen", "migrate", "add", "explain"}
 
-mcp = MCPServer(
-    "nuclear",
-    instructions=(
-        "NuclearLang and Dragonfly. The generators write the standard code, the local Nuclear Developer writes what is "
-        "left; you lead, validate and correct. "
-        "For a feature: 0) project_inspect the project; for every resource the spec names (a model and what is done "
-        "with it: list, get, search, create, update, delete), call generate_resource. Its fields come from the API's "
-        "answer (from_json with the url or a file: api_inspect shows its shape first), from the spec (from_spec: its "
-        "example answer or its Key | Type table) or from fields; when neither the spec nor the API gives them, look "
-        "up the API's documentation with web_search and web_read, and if it is still unclear ask the user, never "
-        "guess. Then give developer_task only what the generators did not write (a use case with its own rules, a "
-        "view's details). "
-        "For any task that writes or changes .nuc (a feature, a bug, a refactor, tests): "
-        "1) call developer_task first with the project folder, a title, the description and the acceptance criteria: "
-        "the local agents plan, write the tests first, write the code, run the tests and the security review, and "
-        "document everything they did in a journal it returns; "
-        "2) read the journal, then validate: nuclear_check of the project must say ok and dragonfly test must pass; "
-        "3) correct only what failed or is wrong, never rewrite what passed; before writing .nuc read "
-        "nuclear_brief(<platform>: backend, mobile or web) and search the graph instead of guessing; "
-        "If the run failed, read its 'Why it failed' (the local diagnoser): when the cause was passing or you fixed it, "
-        "call developer_retry instead of starting again. "
-        "4) call developer_review with the run, what you corrected and why, and the corrected files, so the journal "
-        "keeps your review and the local developer learns from it. "
-        "Write the code yourself only when developer_task cannot run (the local developer is not running) and say so."
-    ),
+# What the server tells every client. The generators' part is the same with or without the local agents.
+LEAD = (
+    "NuclearLang and Dragonfly. The generators write the standard code, the local Nuclear Developer writes what is "
+    "left; you lead, validate and correct. "
+    "For any request, first call graph_strategy with the user's own words: it answers which kind of request it is "
+    "(a whole system, one screen, a rename, a failing test...) and the plan of that kind; follow that plan. "
 )
+GENERATORS = (
+    "For a feature: 0) project_inspect the project; for every resource the spec names (a model and what is done "
+    "with it: list, get, search, create, update, delete), call generate_resource. Its fields come from the API's "
+    "answer (from_json with the url or a file: api_inspect shows its shape first), from the spec (from_spec: its "
+    "example answer or its Key | Type table) or from fields; when neither the spec nor the API gives them, look "
+    "up the API's documentation with web_search and web_read, and if it is still unclear ask the user, never "
+    "guess. A use case that only calls a repository method is generate_usecase with calls. "
+)
+LOCAL = (
+    "Then give developer_task only what the generators did not write (a use case with its own rules, a view's details), "
+    "and wire each use case it wrote with generate_usecase (its alias in the facade, its route). "
+    "For any task that writes or changes .nuc (a feature, a bug, a refactor, tests): "
+    "1) call developer_task first with the project folder, a title, the description and the acceptance criteria: "
+    "the local agents plan, write the tests first, write the code, run the tests and the security review, and "
+    "document everything they did in a journal it returns; "
+    "2) read the journal, then validate: nuclear_check of the project must say ok and dragonfly test must pass; "
+    "3) correct only what failed or is wrong, never rewrite what passed; before writing .nuc read "
+    "nuclear_brief(<platform>: backend, mobile or web) and search the graph instead of guessing; "
+    "If the run failed, read its 'Why it failed' (the local diagnoser): when the cause was passing or you fixed it, "
+    "call developer_retry instead of starting again. "
+    "4) call developer_review with the run, what you corrected and why, and the corrected files, so the journal "
+    "keeps your review and the local developer learns from it. "
+    "Write the code yourself only when developer_task cannot run (the local developer is not running) and say so."
+    
+)
+# A machine set up for remote agents only (ADR-0106) has no Smart Graph and no local developer: the model writes
+# what the generators do not, and the tools that need those services are taken away (the end of this file).
+REMOTE_LEAD = (
+    "NuclearLang and Dragonfly. The generators write the standard code; you write what is left, then validate and "
+    "correct. This machine has no local agents and no Smart Graph (its user chose remote agents only; "
+    "`nuclear-loop setup` installs them). "
+)
+REMOTE = (
+    "Then write only what the generators did not write (a use case with its own rules, a view's details): before "
+    "writing .nuc read nuclear_brief(<platform>: backend, mobile or web) and look up a kind, a decorator or a "
+    "command with nuclear_help instead of guessing; wire each use case you wrote with generate_usecase (its alias in "
+    "the facade, its route). Then validate: nuclear_check of the project must say ok and dragonfly test must pass; "
+    "correct only what failed, never rewrite what passed."
+)
+REMOTE_ONLY = os.environ.get("NUCLEAR_AI_MODE", paths.machine().get("NUCLEAR_AI_MODE", "local")) == "remote"
+
+mcp = MCPServer("nuclear", instructions=REMOTE_LEAD + GENERATORS + REMOTE if REMOTE_ONLY else LEAD + GENERATORS + LOCAL)
 graph = GraphClient("mcp")
 tools = Toolchain()
 
 
 @mcp.tool()
-async def graph_search(query: str, collection: str = "knowledge", k: int = 5, dialect: str = "", kind: str = "") -> str:
-    """Search the Nuclear Smart Graph. collection: knowledge (docs, specs, words, examples, CLI help), examples
-    (solved tasks), prompts, memory (what agents kept about projects). kind (knowledge only): doc, spec, adr,
-    word, example, dialect, cli, context, status. dialect: fastapi, nestjs, flutter, react, typescript, dart, python."""
-    return await graph.search(query, collection, k, dialect, kind)
+async def graph_search(query: str, shelf: str = "", k: int = 5, platform: str = "", kind: str = "", type: str = "") -> str:
+    """Search the Nuclear Smart Graph, by meaning and by exact name (a diagnostic code, a command, a kind). shelf:
+    concepts (what it is, why, how it works), language (how it is written in Nuclear), platforms (kinds, decorators,
+    layout, plugins), tools (CLI commands, MCP tools, HTTP routes, generators, agents), errors (diagnostics, failures
+    and their fixes), capabilities (what can and cannot be done, limits), playbooks (procedures, roles, skills),
+    examples (validated Nuclear), docs (the long documents: dialects, ADRs, context, status), memory (what agents kept
+    about projects); several separated by commas; "" searches every shelf. platform: backend, mobile, web. kind: a
+    kind's rows (usecase, repository...). type: a row type (diagnostic, kind, cli, playbook...). Each card comes with
+    the rows it links to."""
+    return await graph.search(query, shelf, k, platform, kind, type, expand=True)
+
+
+@mcp.tool()
+async def graph_strategy(request: str, platform: str = "") -> str:
+    """Which kind of request this is (a whole system, a component, a resource, one screen, a use case, a rename, a
+    failing test, a question...) and the plan of that kind, step by step with the tool of each step. Call it first,
+    with the user's request in their own words, and follow the plan it answers. platform: backend, mobile or web."""
+    found = await graph.strategy(request, platform)
+    if not found:
+        return "the graph has no strategy: `nuclear-graph ingest` the knowledge base"
+    return f"{found['id']} ({found['why'] or 'by meaning'}; the next closest: {found['second'] or 'none'})\n\n{found['plan']}"
+
+
+@mcp.tool()
+async def graph_card(id: str) -> str:
+    """One row of the graph by its id, with what it links to: error:N0114 (a diagnostic), kind:backend.usecase,
+    decorator:backend.get, tool:dragonfly.gen.resource, mcp:generate_resource, lib:string, platform:mobile,
+    layout:web, playbook:<name>, concept:<name>."""
+    return await graph.card(id) or f"no row `{id}`: search it with graph_search"
 
 
 @mcp.tool()
@@ -159,6 +207,23 @@ async def generate_resource(
             args += [flag, value]
     if actions:
         args += ["--actions", ",".join(actions)]
+    if dry_run:
+        args.append("--dry-run")
+    return await tools.dragonfly(project, args)
+
+
+@mcp.tool()
+async def generate_usecase(project: str, component: str, name: str, calls: str = "", route: str = "", dry_run: bool = False) -> str:
+    """A use case wired into its component: its alias in the facade and, with route (backend), its route in the
+    controller of the route's prefix ("POST orders/{id}/cancel": a {name} is a parameter of the use case; the
+    controller is created when missing). With calls ("OrderRepository.pending": a method that repository declares)
+    the use case is written too, because it only calls that method. Without calls the use case must already be in
+    the project: one with rules of its own is written first (developer_task, or by hand), then this wires it.
+    dry_run shows the files without writing them."""
+    args = ["gen", "usecase", component, name]
+    for flag, value in (("--calls", calls), ("--route", route)):
+        if value:
+            args += [flag, value]
     if dry_run:
         args.append("--dry-run")
     return await tools.dragonfly(project, args)
@@ -335,12 +400,14 @@ async def developer_review(project: str, run: str, notes: str, files: list[str] 
 
 
 @mcp.tool()
-async def developer_code(task: str, platform: str = "backend", path: str = "", kind: str = "", context: str = "") -> str:
+async def developer_code(task: str, platform: str = "backend", path: str = "", kind: str = "", context: str = "", project: str = "") -> str:
     """Ask the local developer (a 3B model with the graph) for ONE .nuc file, outside a developer_task run (a quick
-    piece, a rewrite of one file). Name the path, the kind, every name it
-    must use, the platform (backend, mobile, web; it writes only Nuclear) and paste the files it depends on in context.
-    It checks and repairs its answer before returning."""
-    return await _developer("/developer/code", {"task": task, "platform": platform, "path": path, "kind": kind, "context": context})
+    piece, a rewrite of one file). A short, complete order: the path, the kind, every name and signature it must use
+    and the platform (backend, mobile, web; it writes only Nuclear). With project (the project's folder) it reads by
+    itself the files that declare the names the task writes; otherwise paste them in context. It checks its answer
+    with the compiler, repairs it, holds it to the task's own words and returns it; it does not write the file."""
+    root = _project(project) if project else None
+    return await _developer("/developer/code", {"task": task, "platform": platform, "path": path, "kind": kind, "context": context, "root": str(root or "")})
 
 
 @mcp.tool()
@@ -353,6 +420,11 @@ async def developer_test(task: str, code: str, platform: str = "backend") -> str
 async def developer_security(code: str, platform: str = "backend") -> str:
     """Ask the local security reviewer for the findings of a piece of code."""
     return await _developer("/developer/security", {"task": "review", "platform": platform, "context": code})
+
+
+if REMOTE_ONLY:
+    for _name in [n for n in dict(globals()) if n.startswith(("graph_", "developer_"))]:
+        mcp.remove_tool(_name)
 
 
 def main() -> None:

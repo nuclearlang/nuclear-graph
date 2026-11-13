@@ -1,12 +1,9 @@
-"""The graph's store: Chroma collections whose documents are encrypted and whose vectors come from a local
-embeddings model (Ollama). Only the server process opens it.
+"""The graph's store: one Chroma collection per shelf (ADR-0104), whose documents are encrypted and whose vectors
+come from a local embeddings model (Ollama). Only the server process opens it.
 
-Collections:
-- `knowledge`: the ecosystem's documentation, specs, dialect words, examples and CLI help (made by `ingest`);
-- `examples`: validated task → solution pairs (the distillation of a frontier model; made by the evaluation);
-- `prompts`: the validated prompt of each use case (feature, refactor, bug, docs...);
-- `memory`: what an agent decided to keep about a project while working on it.
-"""
+A row's metadata is in clear (ids, names, keys, filters: what Chroma searches by); its text is sealed. The shelves of
+the knowledge base are made by `ingest`; `prompts` holds the prompt files of this package and `memory` what an agent
+decided to keep about a project while working on it."""
 
 from __future__ import annotations
 
@@ -19,24 +16,40 @@ from chromadb.config import Settings
 
 from . import paths, secrets_store
 from .crypto import Box
+from .shelves import COLLECTIONS, LEGACY, SHELVES
 
-COLLECTIONS = ("knowledge", "nuclear", "examples", "prompts", "memory")
 EMBED_MODEL = os.environ.get("NUCLEAR_GRAPH_EMBED", "embeddinggemma")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
-Embed = Callable[[Sequence[str], bool], list[list[float]]]
+# The texts to embed, already shaped for the model (see `as_document` and `as_query`).
+Embed = Callable[[Sequence[str]], list[list[float]]]
+Item = dict[str, Any]  # {id, document, meta}; when what is embedded is not the document, {title, embed}; a question: {query}
 
 
-def ollama_embed(texts: Sequence[str], query: bool) -> list[list[float]]:
-    """EmbeddingGemma's prompts: a query and a document are embedded differently."""
+def as_document(title: str, text: str) -> str:
+    """EmbeddingGemma's prompt of a document: its title, then its text."""
+    return f"title: {title or 'none'} | text: {text}"
+
+
+def as_query(text: str) -> str:
+    """EmbeddingGemma's prompt of a search."""
+    return f"task: search result | query: {text}"
+
+
+def ollama_embed(shaped: Sequence[str]) -> list[list[float]]:
     import ollama
 
     client = ollama.Client(host=OLLAMA_URL)
-    shaped = [f"task: search result | query: {t}" if query else f"title: none | text: {t}" for t in texts]
     out: list[list[float]] = []
     for i in range(0, len(shaped), 32):
-        out.extend(client.embed(model=EMBED_MODEL, input=shaped[i : i + 32]).embeddings)
+        out.extend(client.embed(model=EMBED_MODEL, input=list(shaped[i : i + 32])).embeddings)
     return [list(v) for v in out]
+
+
+def _storable(meta: dict[str, Any]) -> dict[str, Any]:
+    """What Chroma keeps as metadata: texts, numbers, booleans and lists of texts that are not empty."""
+    return {k: v for k, v in meta.items()
+            if isinstance(v, (str, int, float, bool)) or (isinstance(v, list) and v and all(isinstance(x, str) for x in v))}
 
 
 class Store:
@@ -56,45 +69,80 @@ class Store:
             raise KeyError(f"unknown collection '{name}' (collections: {', '.join(COLLECTIONS)})")
         return self._cols[name]
 
-    def hashes(self, collection: str, source: str) -> dict[str, str]:
-        """id → content hash of the chunks of a source (to skip what did not change)."""
-        got = self._col(collection).get(where={"source": source}, include=["metadatas"])
-        return {i: str(m.get("hash", "")) for i, m in zip(got["ids"], got["metadatas"] or [])}
+    # ---- writing ----
 
-    def put(self, collection: str, items: Sequence[tuple[str, str, dict[str, Any]]]) -> int:
-        """Adds or replaces (id, text, metadata) items; the text is embedded, then stored encrypted."""
-        if not items:
+    def put(self, collection: str, items: Sequence[Item | tuple[str, str, dict[str, Any]]]) -> int:
+        """Adds or replaces items. Each is {id, document, meta} (a tuple `(id, text, meta)` is the same); what is
+        embedded is `embed` under `title` when given, else the document; with `query`, `embed` is embedded as a search
+        is (a question a row answers). The document is stored encrypted."""
+        rows = [i if isinstance(i, dict) else {"id": i[0], "document": i[1], "meta": i[2]} for i in items]
+        if not rows:
             return 0
-        ids = [i for i, _, _ in items]
-        texts = [t for _, t, _ in items]
-        metas = [{k: v for k, v in m.items() if isinstance(v, (str, int, float, bool))} for _, _, m in items]
-        vectors = self._embed(texts, False)
+        shaped = [as_query(r["embed"]) if r.get("query") else
+                  as_document(str(r.get("title") or r["meta"].get("title") or ""), r.get("embed") or r["document"]) for r in rows]
         self._col(collection).upsert(
-            ids=ids, embeddings=vectors, documents=[self._box.seal(t) for t in texts], metadatas=metas
+            ids=[r["id"] for r in rows], embeddings=self._embed(shaped),
+            documents=[self._box.seal(r["document"]) for r in rows], metadatas=[_storable(r["meta"]) for r in rows],
         )
-        return len(ids)
+        return len(rows)
 
     def delete(self, collection: str, ids: Sequence[str]) -> None:
         if ids:
             self._col(collection).delete(ids=list(ids))
 
-    def search(
-        self, query: str, collection: str = "knowledge", k: int = 5, where: dict[str, Any] | None = None
-    ) -> list[dict[str, Any]]:
-        """The `k` closest items: id, text, metadata and distance (0 is the same meaning)."""
+    def drop_legacy(self) -> list[str]:
+        """Removes the collections of before the shelves (ADR-0104)."""
+        gone = []
+        for name in LEGACY:
+            try:
+                self._client.delete_collection(name)
+                gone.append(name)
+            except Exception:  # noqa: BLE001 - it was not there
+                pass
+        return gone
+
+    # ---- versions ----
+
+    def version(self) -> dict[str, int]:
+        """The schema and the revision of the knowledge base this store holds (0: never ingested)."""
+        meta = self._client.get_collection(next(iter(SHELVES))).metadata or {}
+        return {"schema": int(meta.get("schema", 0)), "revision": int(meta.get("revision", 0))}
+
+    def set_version(self, schema: int, revision: int) -> None:
+        for name in SHELVES:
+            self._col(name).modify(metadata={"schema": schema, "revision": revision})
+
+    # ---- reading ----
+
+    def hashes(self, collection: str, where: dict[str, Any] | None = None) -> dict[str, str]:
+        """id → content hash of the items of a collection (to embed again only what changed)."""
+        got = self._col(collection).get(where=where, include=["metadatas"])
+        return {i: str(m.get("hash", "")) for i, m in zip(got["ids"], got["metadatas"] or [])}
+
+    def embed_query(self, query: str) -> list[float]:
+        return self._embed([as_query(query)])[0]
+
+    def near(self, collection: str, vector: list[float], k: int, where: dict[str, Any] | None = None,
+             ids: list[str] | None = None) -> list[dict[str, Any]]:
+        """The `k` items closest to a vector: id, metadata and distance (0 is the same meaning), without their text."""
         col = self._col(collection)
-        if col.count() == 0:
+        count = col.count()
+        if count == 0 or ids == []:
             return []
-        got = col.query(
-            query_embeddings=self._embed([query], True),
-            n_results=min(k, col.count()),
-            where=where or None,
-            include=["documents", "metadatas", "distances"],
-        )
-        out = []
-        for i, doc, meta, dist in zip(got["ids"][0], got["documents"][0], got["metadatas"][0], got["distances"][0]):
-            out.append({"id": i, "text": self._box.open(doc), "meta": meta, "distance": round(float(dist), 4)})
-        return out
+        got = col.query(query_embeddings=[vector], n_results=min(k, count), where=where or None, ids=ids, include=["metadatas", "distances"])
+        return [{"id": i, "meta": m, "distance": round(float(d), 4)} for i, m, d in zip(got["ids"][0], got["metadatas"][0], got["distances"][0])]
+
+    def where(self, collection: str, where: dict[str, Any], limit: int | None = None) -> list[dict[str, Any]]:
+        """The items a filter matches: id and metadata."""
+        got = self._col(collection).get(where=where, limit=limit, include=["metadatas"])
+        return [{"id": i, "meta": m} for i, m in zip(got["ids"], got["metadatas"] or [])]
+
+    def documents(self, collection: str, ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """id → {text, meta} of the items with these ids (the ones that exist)."""
+        if not ids:
+            return {}
+        got = self._col(collection).get(ids=list(dict.fromkeys(ids)), include=["documents", "metadatas"])
+        return {i: {"text": self._box.open(d), "meta": m} for i, d, m in zip(got["ids"], got["documents"] or [], got["metadatas"] or [])}
 
     def get(self, collection: str, where: dict[str, Any]) -> list[dict[str, Any]]:
         got = self._col(collection).get(where=where, include=["documents", "metadatas"])

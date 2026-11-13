@@ -14,6 +14,10 @@ A step of the NuclearLang pipeline failed. Explain to the developer why, in plai
 
 {{evidence}}
 
+## What is known about it
+
+{{known}}
+
 ## Already decided
 
 - Kind of failure: `{{kind}}`

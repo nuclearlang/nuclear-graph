@@ -19,7 +19,7 @@ Rules a small model gets wrong (each one cost a failed task):
 - Write only what the task declares. The files it uses already exist: never copy them into your file, nor a diagram
   or an example's other declarations.
 - Every name, decorator, path and value the task gives appears in the answer exactly as written: a task that says
-  "over the API's \"books\" path" needs `@repository(path = "books")`.
+  "over the API's \"books\" path" needs `@repository(path = "books")`; a method the task names is never renamed.
 - A decorator goes on the line right ABOVE the field or method it applies to, never after it.
 - Keep the kind word in the header: `entity Reader()`, `listener BookEvents(books: BooksAppComponent)`.
 - When the task names several declarations (a `state` and a `graph`, two models), write every one in the file.
@@ -53,22 +53,4 @@ digits(phone: string) string
   phone.replaceAll(" ", "").replaceAll("-", "")
 ```
 
-```nuclear
-// a state model (state_models/): only its states, in one line; a boolean is a state without data
-OrdersState
-  (loaded: Order[], error: OrderError, loading: boolean)
-
-// its state manager (managers/), a different file: @stateModel above, each state method marked with its state
-@stateModel(OrdersState)
-statemanager OrdersManager
-  (orders: OrdersComponent)
-    load()
-
-  @state(OrdersState.loading)
-  loading()
-
-  @before(loading)
-  @state(OrdersState.loaded)
-  load() Result<OrderError, Order[]>
-    ~orders.all()
-```
+The card of the kind you write, every mistake to avoid with it and examples of it come below: they are for this kind.
